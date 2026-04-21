@@ -1,11 +1,11 @@
 """
-ARQ job: process_submission(ctx, submission_id, force=False)
+ARQ job: process_submission(ctx, submission_id, assignment_question_id=None, has_assignment_question_id=False, force=False)
 
 Orchestrates OCR + grading for one submission:
   1. Fetch all submission_photos rows.
   2. For each unprocessed photo: download from Storage → OCR → write results.
   3. When all photos done: advance submissions.status → 'ocr_done'.
-  4. Grade the submission (all assignment questions via LLM).
+  4. Grade via LLM (one question if scoped; otherwise legacy full-assignment).
   5. Advance submissions.status → 'graded'.
 
 Ported from:
@@ -25,6 +25,7 @@ re-queued jobs always begin from a clean state.
   no_photos                 No rows found after PHOTO_FETCH_ATTEMPTS retries
   storage_download_error    Supabase Storage download returned None/failed
   ocr_incomplete            Not all photos have ocr_done_at after OCR loop
+  assignment_question_id mismatch  Submission/question scoping mismatch (safety abort)
   submission_not_found      submissions row missing when refetched for grading
   no_grading_prompt         No active grading_prompt_versions for this exam system
   no_assignment_questions   assignment_questions empty for this assignment
@@ -459,12 +460,30 @@ def _classify_trust_layer(
 
 # ── Main job function ─────────────────────────────────────────────────────────
 
-async def process_submission(ctx: dict, submission_id: str, force: bool = False) -> dict:
+async def process_submission(
+    ctx: dict,
+    submission_id: str,
+    assignment_question_id: str | None = None,
+    has_assignment_question_id: bool = False,
+    force: bool = False,
+) -> dict:
     """
     ARQ job: orchestrate OCR + grading for one submission.
     ctx is the ARQ job context (we don't use any special context values here).
     """
-    logger.info("[job] start submission=%s force=%s", submission_id, force)
+    # Backward compatibility: older enqueues passed (submission_id, force)
+    if isinstance(assignment_question_id, bool) and has_assignment_question_id is False:
+        force = assignment_question_id
+        assignment_question_id = None
+        has_assignment_question_id = False
+
+    logger.info(
+        "[job] start submission=%s force=%s assignment_question_id=%s has_aqid=%s",
+        submission_id,
+        force,
+        assignment_question_id,
+        has_assignment_question_id,
+    )
     svc = get_service_client()
 
     # ── Error helpers (closures over svc + submission_id) ──────────────────────
@@ -495,13 +514,39 @@ async def process_submission(ctx: dict, submission_id: str, force: bool = False)
     # Clear any error left by a previous attempt so the frontend stops showing it.
     await asyncio.to_thread(_clear_processing_error)
 
+    # ── Safety: validate submission ↔ AQID scoping ───────────────────────────
+    def _fetch_submission_scope() -> dict | None:
+        res = (
+            svc.table("submissions")
+            .select("id, status, assignment_id, assignment_question_id")
+            .eq("id", submission_id)
+            .maybe_single()
+            .execute()
+        )
+        return res.data
+
+    submission_scope = await asyncio.to_thread(_fetch_submission_scope)
+    if not submission_scope:
+        await asyncio.to_thread(_set_processing_error, "submission_not_found")
+        return {"submission_id": submission_id, "error": "submission_not_found"}
+
+    submission_aqid = submission_scope.get("assignment_question_id")
+    if has_assignment_question_id:
+        if submission_aqid != assignment_question_id:
+            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+    else:
+        assignment_question_id = submission_aqid
+
+    is_question_scoped = submission_aqid is not None
+
     # ── 1. Fetch submission_photos (with retry for eventual consistency) ─────────
     # submission_photos rows may arrive slightly after the job is enqueued (the
     # Storage trigger is asynchronous), so we retry a few times before giving up.
     def _fetch_photos() -> list[dict]:
         res = (
             svc.table("submission_photos")
-            .select("id, submission_id, page_number, storage_path, ocr_done_at")
+            .select("id, submission_id, question_id, page_number, storage_path, ocr_done_at")
             .eq("submission_id", submission_id)
             .order("page_number")
             .execute()
@@ -525,6 +570,26 @@ async def process_submission(ctx: dict, submission_id: str, force: bool = False)
         )
         await asyncio.to_thread(_set_processing_error, "no_photos")
         return {"submission_id": submission_id, "error": "no_photos"}
+
+    # ── Safety: ensure fetched photos are correctly scoped ─────────
+    wrong_submission_ids = {
+        p.get("submission_id")
+        for p in photos
+        if p.get("submission_id") and p.get("submission_id") != submission_id
+    }
+    if wrong_submission_ids:
+        await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+        return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+
+    if is_question_scoped:
+        wrong_photo_aqids = {
+            p.get("question_id")
+            for p in photos
+            if p.get("question_id") not in (None, submission_aqid)
+        }
+        if wrong_photo_aqids:
+            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
 
     # ── 2. OCR each unprocessed photo ─────────────────────────────
     for photo in photos:
@@ -604,7 +669,7 @@ async def process_submission(ctx: dict, submission_id: str, force: bool = False)
         res = (
             svc.table("submissions")
             .select(
-                "id, status, student_id, assignment_id, "
+                "id, status, student_id, assignment_id, assignment_question_id, "
                 "assignments(id, grading_style, class_id, classes(id, exam_system_id, exam_systems(id, code)))"
             )
             .eq("id", submission_id)
@@ -626,6 +691,16 @@ async def process_submission(ctx: dict, submission_id: str, force: bool = False)
             submission_row.get("status"),
         )
         return {"submission_id": submission_id, "skipped": True, "reason": f"status is {submission_row.get('status')}"}
+
+    submission_aqid = submission_row.get("assignment_question_id")
+    if has_assignment_question_id:
+        if submission_aqid != assignment_question_id:
+            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+    else:
+        assignment_question_id = submission_aqid
+
+    is_question_scoped = submission_aqid is not None
 
     assignment = submission_row.get("assignments") or {}
     if isinstance(assignment, list):
@@ -670,7 +745,7 @@ async def process_submission(ctx: dict, submission_id: str, force: bool = False)
     def _fetch_ocr_pages() -> list[dict]:
         res = (
             svc.table("submission_photos")
-            .select("page_number, ocr_text, ocr_confidence")
+            .select("submission_id, question_id, page_number, ocr_text, ocr_confidence")
             .eq("submission_id", submission_id)
             .order("page_number")
             .execute()
@@ -678,6 +753,26 @@ async def process_submission(ctx: dict, submission_id: str, force: bool = False)
         return res.data or []
 
     ocr_pages = await asyncio.to_thread(_fetch_ocr_pages)
+
+    wrong_ocr_submission_ids = {
+        p.get("submission_id")
+        for p in ocr_pages
+        if p.get("submission_id") and p.get("submission_id") != submission_id
+    }
+    if wrong_ocr_submission_ids:
+        await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+        return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+
+    if is_question_scoped:
+        wrong_ocr_aqids = {
+            p.get("question_id")
+            for p in ocr_pages
+            if p.get("question_id") not in (None, submission_aqid)
+        }
+        if wrong_ocr_aqids:
+            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+
     full_ocr_text = "\n\n--- Page break ---\n\n".join(
         p["ocr_text"] for p in ocr_pages if p.get("ocr_text")
     )
@@ -688,20 +783,41 @@ async def process_submission(ctx: dict, submission_id: str, force: bool = False)
 
     # 4d. Fetch assignment questions
     def _fetch_aq_rows() -> list[dict]:
-        res = (
+        q = (
             svc.table("assignment_questions")
             .select(
-                "id, position, question_id, "
+                "id, assignment_id, position, question_id, "
                 "questions(id, source_id, source_table, diagram_required, ft_eligible_parts, ft_dependencies)"
             )
-            .eq("assignment_id", assignment.get("id"))
-            .order("position")
-            .execute()
         )
+
+        if is_question_scoped:
+            res = (
+                q.eq("id", submission_aqid)
+                .eq("assignment_id", assignment.get("id"))
+                .execute()
+            )
+        else:
+            res = (
+                q.eq("assignment_id", assignment.get("id"))
+                .order("position")
+                .execute()
+            )
+
         return res.data or []
 
     aq_rows = await asyncio.to_thread(_fetch_aq_rows)
     if not aq_rows:
+        if is_question_scoped:
+            logger.error(
+                "[job] submission=%s: assignment_question_id=%s not found for assignment=%s",
+                submission_id,
+                submission_aqid,
+                assignment.get("id"),
+            )
+            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+
         logger.error("[job] submission=%s: no assignment_questions rows", submission_id)
         await asyncio.to_thread(_set_processing_error, "no_assignment_questions")
         return {"submission_id": submission_id, "error": "no_assignment_questions"}
@@ -780,6 +896,17 @@ async def process_submission(ctx: dict, submission_id: str, force: bool = False)
         logger.error("[job] submission=%s: no resolvable questions", submission_id)
         await asyncio.to_thread(_set_processing_error, "no_resolvable_questions")
         return {"submission_id": submission_id, "error": "no_resolvable_questions"}
+
+    if is_question_scoped:
+        if len(questions) != 1 or questions[0].assignment_question_id != str(submission_aqid):
+            logger.error(
+                "[job] submission=%s: scoped assignment_question_id mismatch expected=%s got=%s",
+                submission_id,
+                submission_aqid,
+                [q.assignment_question_id for q in questions],
+            )
+            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
 
     # ── 5. Grade each question ─────────────────────────────────────
     graded_count = 0

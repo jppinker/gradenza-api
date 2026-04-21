@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Annotated
 
 from arq.connections import ArqRedis
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from gradenza_api.auth import AuthUser, get_auth_user
 from gradenza_api.services.supabase_client import get_service_client
@@ -27,7 +28,10 @@ router = APIRouter(prefix="/v1/submissions", tags=["submissions"])
 # ── Request / Response models ──────────────────────────────────────────────────
 
 class ProcessRequest(BaseModel):
-    force: bool = False
+    model_config = ConfigDict(extra="forbid")
+
+    submission_id: str
+    assignment_question_id: str | None = None
 
 
 class ProcessResponse(BaseModel):
@@ -116,13 +120,52 @@ async def process_submission(
 ) -> ProcessResponse:
     await _authorize_submission(submission_id, user)
 
+    if body.submission_id != submission_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="submission_id mismatch")
+
+    has_aqid = "assignment_question_id" in body.model_fields_set
+    if has_aqid:
+        def _fetch_scope() -> dict | None:
+            svc = get_service_client()
+            res = (
+                svc.table("submissions")
+                .select("id, assignment_question_id")
+                .eq("id", submission_id)
+                .maybe_single()
+                .execute()
+            )
+            return res.data
+
+        scope = await asyncio.to_thread(_fetch_scope)
+        if not scope:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found")
+
+        submission_aqid = scope.get("assignment_question_id")
+        if submission_aqid != body.assignment_question_id:
+            def _write_mismatch() -> None:
+                svc = get_service_client()
+                svc.table("submissions").update({
+                    "processing_error": "assignment_question_id mismatch",
+                    "processing_error_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", submission_id).execute()
+
+            await asyncio.to_thread(_write_mismatch)
+            logger.warning(
+                "[submissions] assignment_question_id mismatch submission=%s expected=%s got=%s",
+                submission_id,
+                submission_aqid,
+                body.assignment_question_id,
+            )
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="assignment_question_id mismatch")
+
     redis: ArqRedis = request.app.state.redis
     job_id = f"process_submission_{submission_id}"
 
     job = await redis.enqueue_job(
         "process_submission",
         submission_id,
-        body.force,
+        body.assignment_question_id,
+        has_aqid,
         _job_id=job_id,
     )
 

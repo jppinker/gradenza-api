@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+import gradenza_api.jobs.process_submission as process_submission_module
 from gradenza_api.jobs.process_submission import (
     PHOTO_FETCH_ATTEMPTS,
     ParsedMarkschemeStep,
@@ -21,6 +22,16 @@ from gradenza_api.jobs.process_submission import (
     _total_available_marks,
     process_submission,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disable_asyncio_to_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avoid threads in unit tests (sandbox may not wake the loop reliably)."""
+
+    async def _to_thread(func, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(process_submission_module.asyncio, "to_thread", _to_thread)
 
 
 # ── _clamp01 ──────────────────────────────────────────────────────────────────
@@ -163,7 +174,11 @@ async def test_fetch_photos_retrying_exhausts_all_attempts():
 #   1. _clear_processing_error() at job start → {processing_error: None, ...}
 #   2. _set_processing_error(code)            → {processing_error: "<code>", ...}
 
-def _make_svc(photos_data: list[dict]) -> tuple[MagicMock, MagicMock, MagicMock]:
+def _make_svc(
+    photos_data: list[dict],
+    *,
+    submission_row: dict | None = None,
+) -> tuple[MagicMock, MagicMock, MagicMock]:
     """Return (mock_svc, mock_photos_tbl, mock_subs_tbl) with photos_data wired up."""
     mock_photos_tbl = MagicMock()
     (
@@ -174,7 +189,23 @@ def _make_svc(photos_data: list[dict]) -> tuple[MagicMock, MagicMock, MagicMock]
         .data
     ) = photos_data
 
+    # process_submission() now fetches the submission early for AQID scoping validation.
+    if submission_row is None:
+        submission_row = {
+            "id": "sub-x",
+            "status": "submitted",
+            "assignment_id": "assign-1",
+            "assignment_question_id": None,
+        }
+
     mock_subs_tbl = MagicMock()
+    (
+        mock_subs_tbl.select.return_value
+        .eq.return_value
+        .maybe_single.return_value
+        .execute.return_value
+        .data
+    ) = submission_row
 
     mock_svc = MagicMock()
     mock_svc.table.side_effect = (
@@ -277,6 +308,7 @@ _SUBMISSION_ROW = {
     "status": "ocr_done",
     "student_id": "stu-1",
     "assignment_id": "assign-1",
+    "assignment_question_id": None,
     "assignments": {
         "id": "assign-1",
         "grading_style": "ib_style",
@@ -351,7 +383,7 @@ def _make_grading_svc(upsert_raises: bool = False):
         elif "ocr_text" in fields:
             # _fetch_ocr_pages
             m.eq.return_value.order.return_value.execute.return_value.data = [
-                {"page_number": 1, "ocr_text": "Student answer: x=2", "ocr_confidence": 0.9}
+                {"submission_id": "sub-grade", "question_id": None, "page_number": 1, "ocr_text": "Student answer: x=2", "ocr_confidence": 0.9}
             ]
         else:
             # _fetch_photos
@@ -468,3 +500,177 @@ async def test_grading_results_upsert_failure_sets_db_write_error():
     assert error_payload["processing_error"] == "db_write_error"
     assert error_payload["processing_error_at"] is not None
     assert not any(c.args[0].get("status") == "graded" for c in update_calls)
+
+
+# ── Integration: AQID scoping safety checks ─────────────────────────────────
+
+async def test_process_submission_assignment_question_id_mismatch_writes_error_and_exits():
+    """Mismatch between request AQID and submissions.assignment_question_id aborts early."""
+    mock_svc, mock_photos_tbl, mock_subs_tbl = _make_svc(
+        photos_data=[{
+            "id": "ph-1",
+            "submission_id": "sub-mismatch",
+            "page_number": 1,
+            "storage_path": "s/p.jpg",
+            "ocr_done_at": None,
+        }],
+        submission_row={
+            "id": "sub-mismatch",
+            "status": "submitted",
+            "assignment_id": "assign-1",
+            "assignment_question_id": "aq-1",
+        },
+    )
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=mock_svc),
+        patch("gradenza_api.jobs.process_submission._run_ocr") as mock_ocr,
+        patch("gradenza_api.jobs.process_submission.call_openrouter") as mock_llm,
+    ):
+        result = await process_submission(
+            {},
+            submission_id="sub-mismatch",
+            assignment_question_id="aq-2",
+            has_assignment_question_id=True,
+            force=False,
+        )
+
+    assert result == {"submission_id": "sub-mismatch", "error": "assignment_question_id mismatch"}
+    _assert_error_writes(mock_subs_tbl, "assignment_question_id mismatch")
+    mock_ocr.assert_not_called()
+    mock_llm.assert_not_called()
+    # Should abort before fetching photos
+    mock_photos_tbl.select.assert_not_called()
+
+
+async def test_question_scoped_photo_question_id_mismatch_aborts_before_ocr():
+    """Question-scoped submissions must not contain photos tagged to a different AQID."""
+    mock_svc, mock_photos_tbl, mock_subs_tbl = _make_svc(
+        photos_data=[{
+            "id": "ph-1",
+            "submission_id": "sub-q",
+            "question_id": "aq-2",
+            "page_number": 1,
+            "storage_path": "s/p.jpg",
+            "ocr_done_at": None,
+        }],
+        submission_row={
+            "id": "sub-q",
+            "status": "submitted",
+            "assignment_id": "assign-1",
+            "assignment_question_id": "aq-1",
+        },
+    )
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=mock_svc),
+        patch("gradenza_api.jobs.process_submission._run_ocr") as mock_ocr,
+        patch("gradenza_api.jobs.process_submission.call_openrouter") as mock_llm,
+    ):
+        result = await process_submission({}, submission_id="sub-q", force=False)
+
+    assert result == {"submission_id": "sub-q", "error": "assignment_question_id mismatch"}
+    _assert_error_writes(mock_subs_tbl, "assignment_question_id mismatch")
+    mock_ocr.assert_not_called()
+    mock_llm.assert_not_called()
+
+
+_AQ_ROW_2 = {
+    "id": "aq-2",
+    "position": 2,
+    "question_id": "q-2",
+    "questions": {
+        "id": "q-2",
+        "source_id": "123",
+        "source_table": "ib_math_questionbank",
+        "diagram_required": False,
+        "ft_eligible_parts": [],
+        "ft_dependencies": {},
+    },
+}
+
+
+def _make_question_scoped_grading_svc():
+    """Build a grading svc where submission is question-scoped (assignment_question_id != NULL)."""
+    photos_tbl = MagicMock()
+    subs_tbl = MagicMock()
+    prompt_tbl = MagicMock()
+    aq_tbl = MagicMock()
+    ib_tbl = MagicMock()
+    gr_tbl = MagicMock()
+
+    def photos_select(fields):
+        m = MagicMock()
+        if fields.strip() == "ocr_done_at":
+            # _check_all_done: no .order() call
+            m.eq.return_value.execute.return_value.data = [_PHOTO_DONE]
+        elif "ocr_text" in fields:
+            # _fetch_ocr_pages
+            m.eq.return_value.order.return_value.execute.return_value.data = [
+                {"submission_id": "sub-grade", "question_id": "aq-1", "page_number": 1, "ocr_text": "Student answer: x=2", "ocr_confidence": 0.9}
+            ]
+        else:
+            # _fetch_photos
+            m.eq.return_value.order.return_value.execute.return_value.data = [_PHOTO_DONE | {"question_id": "aq-1"}]
+        return m
+
+    photos_tbl.select.side_effect = photos_select
+
+    scoped_submission = dict(_SUBMISSION_ROW)
+    scoped_submission["assignment_question_id"] = "aq-1"
+
+    subs_tbl.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = scoped_submission
+
+    prompt_tbl.select.return_value.eq.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = _PROMPT_ROW
+
+    # assignment_questions: if legacy query is used, return TWO rows; scoped query should return ONE.
+    aq_select = MagicMock()
+    aq_tbl.select.return_value = aq_select
+    aq_select.eq.return_value.eq.return_value.execute.return_value.data = [_AQ_ROW]
+    aq_select.eq.return_value.order.return_value.execute.return_value.data = [_AQ_ROW, _AQ_ROW_2]
+
+    ib_tbl.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = _IB_ROW
+
+    table_map = {
+        "submission_photos": photos_tbl,
+        "submissions": subs_tbl,
+        "grading_prompt_versions": prompt_tbl,
+        "assignment_questions": aq_tbl,
+        "ib_math_questionbank": ib_tbl,
+        "grading_results": gr_tbl,
+    }
+    svc = MagicMock()
+    svc.table.side_effect = lambda name: table_map.get(name, MagicMock())
+
+    return svc, subs_tbl, gr_tbl, aq_tbl
+
+
+async def test_question_scoped_submission_grades_only_one_aqid():
+    """Question-scoped submissions must not loop over all assignment questions."""
+    svc, subs_tbl, gr_tbl, aq_tbl = _make_question_scoped_grading_svc()
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "gradenza_api.jobs.process_submission.call_openrouter",
+            new_callable=AsyncMock,
+            return_value=_LLM_RESPONSE,
+        ) as mock_llm,
+    ):
+        result = await process_submission(
+            {},
+            submission_id="sub-grade",
+            assignment_question_id="aq-1",
+            has_assignment_question_id=True,
+            force=False,
+        )
+
+    assert result["questions_graded"] == 1
+    assert result["errors"] == 0
+    assert mock_llm.await_count == 1
+    assert gr_tbl.upsert.call_count == 1
+
+    # Ensure scoped AQID query path was used
+    aq_calls = aq_tbl.select.return_value.eq.call_args_list
+    assert any(c.args == ("id", "aq-1") for c in aq_calls)
