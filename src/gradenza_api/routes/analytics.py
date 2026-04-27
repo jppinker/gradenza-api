@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 from gradenza_api.auth import AuthUser, require_roles
 from gradenza_api.services.openrouter import call_openrouter
 from gradenza_api.services.student_context import assemble_context, verify_teacher_access
+from gradenza_api.services.supabase_client import get_service_client
+from gradenza_api.services.usage import AIUsage, record_ai_usage
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/analytics", tags=["analytics"])
@@ -135,27 +137,64 @@ async def student_insight(
         messages.append({"role": turn.role, "content": turn.content})
     messages.append({"role": "user", "content": user_message})
 
+    svc = get_service_client()
+    caller_id = user.id or "internal"
+
     try:
-        answer = await call_openrouter(
+        result = await call_openrouter(
             model=INSIGHT_MODEL,
             temperature=INSIGHT_TEMPERATURE,
             messages=messages,
         )
+        answer = result.content
+        ai_usage = AIUsage(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+            model=result.usage.model,
+            request_id=result.usage.request_id,
+        )
     except Exception as exc:
         logger.error("[student-insight][%s] OpenRouter error: %s", request_id, exc)
+        await record_ai_usage(
+            svc,
+            user_id=caller_id,
+            source="analytics",
+            entity_type="student",
+            entity_id=body.student_id,
+            route="POST /v1/analytics/student-insight",
+            status="error",
+            error_message=str(exc),
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="LLM service error",
         ) from exc
 
+    await record_ai_usage(
+        svc,
+        user_id=caller_id,
+        source="analytics",
+        entity_type="student",
+        entity_id=body.student_id,
+        route="POST /v1/analytics/student-insight",
+        usage=ai_usage,
+        status="success",
+    )
+
     logger.info(
-        "[student-insight][%s] done answer_len=%d",
+        "[student-insight][%s] done answer_len=%d tokens=%s/%s",
         request_id,
         len(answer),
+        ai_usage.prompt_tokens,
+        ai_usage.completion_tokens,
     )
 
     return StudentInsightResponse(
         answer=answer,
         context_used=context_used,
-        tokens=TokenUsage(),
+        tokens=TokenUsage(
+            prompt_tokens=ai_usage.prompt_tokens,
+            completion_tokens=ai_usage.completion_tokens,
+        ),
     )

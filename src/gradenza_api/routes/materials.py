@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 
 from gradenza_api.auth import AuthUser, require_roles
 from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
+from gradenza_api.services.supabase_client import get_service_client
+from gradenza_api.services.usage import AIUsage, record_ai_usage
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/materials", tags=["materials"])
@@ -94,8 +96,12 @@ async def generate_material(
         len(prompt),
     )
 
+    svc = get_service_client()
+    ai_usage: AIUsage | None = None
+    raw: str = ""
+
     try:
-        raw = await call_openrouter(
+        result = await call_openrouter(
             model=GENERATE_MODEL,
             temperature=GENERATE_TEMPERATURE,
             messages=[
@@ -103,12 +109,39 @@ async def generate_material(
                 {"role": "user", "content": prompt},
             ],
         )
+        raw = result.content
+        ai_usage = AIUsage(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+            model=result.usage.model,
+            request_id=result.usage.request_id,
+        )
     except Exception as exc:
         logger.error("[generate-material][%s] OpenRouter error: %s", request_id, exc)
+        await record_ai_usage(
+            svc,
+            user_id=user.id,
+            source="materials",
+            entity_type="material",
+            route="POST /v1/materials/generate",
+            status="error",
+            error_message=str(exc),
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Generation service error",
         ) from exc
+
+    await record_ai_usage(
+        svc,
+        user_id=user.id,
+        source="materials",
+        entity_type="material",
+        route="POST /v1/materials/generate",
+        usage=ai_usage,
+        status="success",
+    )
 
     # Parse JSON from model output
     stripped = strip_json_fences(raw)

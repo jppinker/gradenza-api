@@ -42,12 +42,13 @@ import base64
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
 from gradenza_api.services.supabase_client import get_service_client
+from gradenza_api.services.usage import AIUsage, record_ai_usage
 from gradenza_api.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -152,8 +153,14 @@ async def _fetch_photos_retrying(
     return []
 
 
-async def _run_ocr(image_base64: str, mime_type: str) -> tuple[str, float]:
-    """Run OCR via OpenRouter. Returns (text, confidence)."""
+async def _run_ocr(
+    image_base64: str,
+    mime_type: str,
+    *,
+    user_id: str,
+    submission_id: str,
+) -> tuple[str, float]:
+    """Run OCR via OpenRouter. Returns (text, confidence). Records usage event."""
     messages = [
         {"role": "system", "content": OCR_SYSTEM_PROMPT},
         {
@@ -171,15 +178,45 @@ async def _run_ocr(image_base64: str, mime_type: str) -> tuple[str, float]:
         },
     ]
 
+    svc = get_service_client()
     try:
-        raw = await call_openrouter(
+        result = await call_openrouter(
             model=OCR_MODEL,
             temperature=OCR_TEMPERATURE,
             messages=messages,
         )
+        raw = result.content
+        ai_usage = AIUsage(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+            model=result.usage.model,
+            request_id=result.usage.request_id,
+        )
     except Exception as exc:
         logger.error("[ocr] OpenRouter call failed: %s", exc)
+        await record_ai_usage(
+            svc,
+            user_id=user_id,
+            source="autograde",
+            entity_type="submission",
+            entity_id=submission_id,
+            route="job:process_submission/ocr",
+            status="error",
+            error_message=str(exc),
+        )
         return "", 0.0
+
+    await record_ai_usage(
+        svc,
+        user_id=user_id,
+        source="autograde",
+        entity_type="submission",
+        entity_id=submission_id,
+        route="job:process_submission/ocr",
+        usage=ai_usage,
+        status="success",
+    )
 
     stripped = strip_json_fences(raw)
     try:
@@ -367,6 +404,8 @@ async def _call_grading_llm(
     ocr_text: str,
     has_low_confidence_ocr: bool,
     extracted_answers: dict[str, str | None],
+    user_id: str,
+    submission_id: str,
 ) -> dict | None:
     note_low_ocr = (
         "\n**Note for examiner:** One or more pages in this submission had OCR confidence "
@@ -414,8 +453,9 @@ async def _call_grading_llm(
 
 Grade this question following the IB marking conventions in the system prompt. Return valid JSON only."""
 
+    svc = get_service_client()
     try:
-        raw = await call_openrouter(
+        result = await call_openrouter(
             model=GRADING_MODEL,
             temperature=GRADING_TEMPERATURE,
             messages=[
@@ -423,9 +463,38 @@ Grade this question following the IB marking conventions in the system prompt. R
                 {"role": "user", "content": user_message},
             ],
         )
+        raw = result.content
+        ai_usage = AIUsage(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+            model=result.usage.model,
+            request_id=result.usage.request_id,
+        )
     except Exception as exc:
         logger.error("[grade] OpenRouter call failed: %s", exc)
+        await record_ai_usage(
+            svc,
+            user_id=user_id,
+            source="autograde",
+            entity_type="submission",
+            entity_id=submission_id,
+            route="job:process_submission/grade",
+            status="error",
+            error_message=str(exc),
+        )
         return None
+
+    await record_ai_usage(
+        svc,
+        user_id=user_id,
+        source="autograde",
+        entity_type="submission",
+        entity_id=submission_id,
+        route="job:process_submission/grade",
+        usage=ai_usage,
+        status="success",
+    )
 
     stripped = strip_json_fences(raw)
     try:
@@ -518,7 +587,7 @@ async def process_submission(
     def _fetch_submission_scope() -> dict | None:
         res = (
             svc.table("submissions")
-            .select("id, status, assignment_id, assignment_question_id")
+            .select("id, status, student_id, assignment_id, assignment_question_id")
             .eq("id", submission_id)
             .maybe_single()
             .execute()
@@ -529,6 +598,9 @@ async def process_submission(
     if not submission_scope:
         await asyncio.to_thread(_set_processing_error, "submission_not_found")
         return {"submission_id": submission_id, "error": "submission_not_found"}
+
+    # user_id for all usage events in this job: the student who owns the submission
+    job_user_id: str = submission_scope.get("student_id") or ""
 
     submission_aqid = submission_scope.get("assignment_question_id")
     if has_assignment_question_id:
@@ -618,7 +690,12 @@ async def process_submission(
 
         image_base64 = base64.b64encode(raw_bytes).decode("utf-8")
 
-        ocr_text, ocr_confidence = await _run_ocr(image_base64, mime_type)
+        ocr_text, ocr_confidence = await _run_ocr(
+            image_base64,
+            mime_type,
+            user_id=job_user_id,
+            submission_id=submission_id,
+        )
 
         # Write OCR result
         def _write_ocr(photo_id: str, text: str, conf: float) -> None:
@@ -691,6 +768,10 @@ async def process_submission(
             submission_row.get("status"),
         )
         return {"submission_id": submission_id, "skipped": True, "reason": f"status is {submission_row.get('status')}"}
+
+    # Refresh user_id in case student_id was missing from the initial scope fetch
+    if not job_user_id:
+        job_user_id = submission_row.get("student_id") or ""
 
     submission_aqid = submission_row.get("assignment_question_id")
     if has_assignment_question_id:
@@ -923,6 +1004,8 @@ async def process_submission(
                 ocr_text=full_ocr_text,
                 has_low_confidence_ocr=has_low_confidence_ocr,
                 extracted_answers=extracted_answers,
+                user_id=job_user_id,
+                submission_id=submission_id,
             )
         else:
             simple_q = ParsedQuestion(
@@ -945,6 +1028,8 @@ async def process_submission(
                 ocr_text=full_ocr_text,
                 has_low_confidence_ocr=has_low_confidence_ocr,
                 extracted_answers=extracted_answers,
+                user_id=job_user_id,
+                submission_id=submission_id,
             )
 
         # Populate extracted_answers from LLM result

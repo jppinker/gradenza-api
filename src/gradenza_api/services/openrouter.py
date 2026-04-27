@@ -3,11 +3,15 @@ OpenRouter HTTP client with retry logic.
 
 All model calls go through `call_openrouter()`.  Retries on 429 and
 5xx responses with exponential backoff via tenacity.
+
+Returns an OpenRouterResult dataclass so callers can access both the
+response text and token-usage metadata for billing/analytics.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -41,6 +45,25 @@ class _OpenRouterHTTPError(Exception):
         self.body = body
 
 
+@dataclass
+class OpenRouterUsage:
+    """Token counts and identifiers from an OpenRouter chat completion."""
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    model: str | None = None
+    request_id: str | None = None  # OpenRouter's response "id" field
+
+
+@dataclass
+class OpenRouterResult:
+    """Return value of call_openrouter(): response text plus usage metadata."""
+
+    content: str
+    usage: OpenRouterUsage
+
+
 @retry(
     retry=retry_if_exception(_is_retryable),
     wait=wait_exponential(multiplier=1, min=2, max=30),
@@ -53,10 +76,11 @@ async def call_openrouter(
     messages: list[dict[str, Any]],
     temperature: float = 0.1,
     timeout: float = _DEFAULT_TIMEOUT,
-) -> str:
+) -> OpenRouterResult:
     """
     Call the OpenRouter chat completions endpoint.
-    Returns the raw text content of the first choice.
+
+    Returns an OpenRouterResult with the response text and usage metadata.
     Raises _OpenRouterHTTPError on non-2xx responses (with retry on 429/5xx).
     """
     body = {
@@ -87,7 +111,17 @@ async def call_openrouter(
 
     data = res.json()
     content: str = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    return content
+
+    raw_usage = data.get("usage") or {}
+    usage = OpenRouterUsage(
+        prompt_tokens=raw_usage.get("prompt_tokens"),
+        completion_tokens=raw_usage.get("completion_tokens"),
+        total_tokens=raw_usage.get("total_tokens"),
+        model=data.get("model") or model,
+        request_id=data.get("id"),
+    )
+
+    return OpenRouterResult(content=content, usage=usage)
 
 
 def strip_json_fences(text: str) -> str:

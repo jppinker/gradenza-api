@@ -19,6 +19,8 @@ from typing import Annotated
 
 from gradenza_api.auth import AuthUser, require_roles
 from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
+from gradenza_api.services.supabase_client import get_service_client
+from gradenza_api.services.usage import AIUsage, record_ai_usage
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/ocr", tags=["ocr"])
@@ -115,18 +117,51 @@ async def image_to_text(
         },
     ]
 
+    svc = get_service_client()
+    ai_usage: AIUsage | None = None
+    call_status = "success"
+    call_error: str | None = None
+
     try:
-        raw = await call_openrouter(
+        result = await call_openrouter(
             model=OCR_MODEL,
             temperature=OCR_TEMPERATURE,
             messages=messages,
         )
+        raw = result.content
+        ai_usage = AIUsage(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+            model=result.usage.model,
+            request_id=result.usage.request_id,
+        )
     except Exception as exc:
         logger.error("[ocr/image-to-text] OpenRouter error: %s", exc)
+        call_status = "error"
+        call_error = str(exc)
+        await record_ai_usage(
+            svc,
+            user_id=user.id,
+            source="ocr",
+            route="POST /v1/ocr/image-to-text",
+            status="error",
+            error_message=call_error,
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="OCR service error",
         ) from exc
+
+    await record_ai_usage(
+        svc,
+        user_id=user.id,
+        source="ocr",
+        route="POST /v1/ocr/image-to-text",
+        usage=ai_usage,
+        status=call_status,
+        error_message=call_error,
+    )
 
     stripped = strip_json_fences(raw)
     text = raw
