@@ -13,7 +13,7 @@ from arq.connections import RedisSettings
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from gradenza_api.routes import analytics, materials, ocr, submissions
+from gradenza_api.routes import analytics, class_pdf_notes, materials, ocr, submissions
 from gradenza_api.settings import settings
 
 logging.basicConfig(
@@ -57,6 +57,7 @@ app.add_middleware(
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 app.include_router(analytics.router)
+app.include_router(class_pdf_notes.router)
 app.include_router(materials.router)
 app.include_router(ocr.router)
 app.include_router(submissions.router)

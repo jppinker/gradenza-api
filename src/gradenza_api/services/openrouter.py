@@ -76,18 +76,24 @@ async def call_openrouter(
     messages: list[dict[str, Any]],
     temperature: float = 0.1,
     timeout: float = _DEFAULT_TIMEOUT,
+    response_format: dict[str, Any] | None = None,
 ) -> OpenRouterResult:
     """
     Call the OpenRouter chat completions endpoint.
 
     Returns an OpenRouterResult with the response text and usage metadata.
     Raises _OpenRouterHTTPError on non-2xx responses (with retry on 429/5xx).
+
+    Pass response_format to request structured output, e.g.
+    {"type": "json_schema", "json_schema": {...}} or {"type": "json_object"}.
     """
-    body = {
+    body: dict[str, Any] = {
         "model": model,
         "temperature": temperature,
         "messages": messages,
     }
+    if response_format is not None:
+        body["response_format"] = response_format
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         res = await client.post(
