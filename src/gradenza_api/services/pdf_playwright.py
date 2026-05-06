@@ -10,8 +10,51 @@ We use Playwright (Chromium) instead of WeasyPrint because Class PDF Notes rely 
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_CHROMIUM_ARGS: list[str] = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+]
+
+
+def get_playwright_chromium_executable_path() -> str | None:
+    """
+    Best-effort lookup of the Chromium executable Playwright expects to use.
+
+    This does not launch Chromium; it only asks Playwright where it *expects*
+    the bundled executable to be located, then callers can check file existence.
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        with sync_playwright() as p:
+            return p.chromium.executable_path
+    except Exception as exc:
+        logger.warning("[playwright] unable to determine chromium executable_path: %s", exc)
+        return None
+
+
+def get_playwright_runtime_diagnostics() -> dict[str, str]:
+    """
+    Return small, log-friendly Playwright diagnostics for production debugging.
+    """
+    diag: dict[str, str] = {
+        "PLAYWRIGHT_BROWSERS_PATH": os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""),
+    }
+
+    chromium_path = get_playwright_chromium_executable_path()
+    diag["chromium_executable_path"] = chromium_path or ""
+    if chromium_path:
+        diag["chromium_executable_exists"] = str(Path(chromium_path).is_file())
+    return diag
 
 
 async def render_html_to_pdf_bytes(html: str) -> tuple[bytes, list[str]]:
@@ -35,9 +78,9 @@ async def render_html_to_pdf_bytes(html: str) -> tuple[bytes, list[str]]:
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
+            headless=True,
             args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
+                *_DEFAULT_CHROMIUM_ARGS,
             ]
         )
         try:

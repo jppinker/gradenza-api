@@ -1252,7 +1252,14 @@ async def export_pdf(
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         page = await browser.new_page()
         await page.set_content(html, wait_until="networkidle")
         pdf_bytes: bytes = await page.pdf(format="A4", print_background=True)

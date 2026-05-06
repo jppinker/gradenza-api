@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from gradenza_api.routes import analytics, class_pdf_notes, materials, ocr, quiz, submissions
+from gradenza_api.services.pdf_playwright import get_playwright_runtime_diagnostics
 from gradenza_api.settings import settings
 
 logging.basicConfig(
@@ -27,6 +28,23 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup: create Redis pool. Shutdown: close it."""
+    try:
+        diag = get_playwright_runtime_diagnostics()
+        logger.info(
+            "[playwright] PLAYWRIGHT_BROWSERS_PATH=%s",
+            diag.get("PLAYWRIGHT_BROWSERS_PATH", ""),
+        )
+        if diag.get("chromium_executable_path"):
+            logger.info(
+                "[playwright] chromium_executable_path=%s exists=%s",
+                diag.get("chromium_executable_path", ""),
+                diag.get("chromium_executable_exists", ""),
+            )
+        else:
+            logger.info("[playwright] chromium_executable_path=<unknown>")
+    except Exception as exc:
+        logger.warning("[playwright] diagnostics failed: %s", exc)
+
     logger.info("[app] startup — connecting to Redis at %s", settings.redis_url)
     app.state.redis = await create_pool(
         RedisSettings.from_dsn(settings.redis_url)
