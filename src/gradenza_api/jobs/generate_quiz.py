@@ -63,8 +63,13 @@ Return ONLY the raw JSON array. No markdown fences, no explanation."""
 
 
 async def generate_quiz(ctx: dict, *, session_id: str) -> None:
-    logger.info("[generate_quiz] start session=%s", session_id)
+    logger.info("[generate_quiz] job started session=%s", session_id)
     svc = get_service_client()
+
+    def _set_generating() -> None:
+        svc.table("quiz_builder_sessions").update({"status": "generating", "error_message": None}).eq("id", session_id).execute()
+
+    await asyncio.to_thread(_set_generating)
 
     def _fetch() -> tuple[dict | None, dict | None, dict | None]:
         sess = (
@@ -100,7 +105,7 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
     session, source, blueprint = await asyncio.to_thread(_fetch)
 
     if not session:
-        logger.error("[generate_quiz] session not found: %s", session_id)
+        logger.error("[generate_quiz] session not found session=%s", session_id)
         return
 
     source_text: str = (source or {}).get("extracted_text") or "(no source text provided)"
@@ -115,8 +120,11 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
         blueprint=json.dumps(blueprint_items, indent=2),
     )
 
-    def _set_error() -> None:
-        svc.table("quiz_builder_sessions").update({"status": "error"}).eq("id", session_id).execute()
+    def _set_error(msg: str) -> None:
+        svc.table("quiz_builder_sessions").update({
+            "status": "error",
+            "error_message": msg,
+        }).eq("id", session_id).execute()
 
     try:
         result = await call_openrouter(
@@ -129,8 +137,8 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
         if not isinstance(questions, list):
             raise ValueError(f"Expected list, got {type(questions).__name__}")
     except Exception as exc:
-        logger.error("[generate_quiz] LLM/parse error session=%s: %s", session_id, exc)
-        await asyncio.to_thread(_set_error)
+        logger.error("[generate_quiz] generation failed session=%s exc=%s", session_id, exc)
+        await asyncio.to_thread(_set_error, str(exc))
         return
 
     def _save(qs: list[dict[str, Any]]) -> None:
@@ -150,4 +158,4 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
         svc.table("quiz_builder_sessions").update({"status": "review"}).eq("id", session_id).execute()
 
     await asyncio.to_thread(_save, questions)
-    logger.info("[generate_quiz] done session=%s questions=%d", session_id, len(questions))
+    logger.info("[generate_quiz] generation completed session=%s questions=%d", session_id, len(questions))

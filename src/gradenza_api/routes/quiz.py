@@ -225,6 +225,7 @@ Session details:
 - Subject: {subject}
 - Grade level: {grade_level}
 - Number of questions requested: {question_count}
+- Question type split: {mcq_instruction}
 
 Source material (first 2000 chars):
 {source_text}
@@ -245,6 +246,7 @@ Return ONLY the raw JSON array. No markdown, no explanation."""
 
 class BlueprintRequest(BaseModel):
     question_count: int = 10
+    mcq_count: int | None = None
 
 
 @router.post("/sessions/{session_id}/blueprint", summary="Generate question blueprint via LLM")
@@ -270,12 +272,19 @@ async def generate_blueprint(
     source = await asyncio.to_thread(_get_source)
     source_text = (source or {}).get("extracted_text") or "(no source text provided)"
 
+    if body.mcq_count is not None:
+        fr_count = body.question_count - body.mcq_count
+        mcq_instruction = f"exactly {body.mcq_count} multiple_choice and {fr_count} free-response (fill_blank/short_answer/long_answer)"
+    else:
+        mcq_instruction = "choose an appropriate mix based on the preset"
+
     prompt = _BLUEPRINT_PROMPT.format(
         mode=session.get("mode", "from_prompt"),
         preset=session.get("preset", "standard_worksheet"),
         subject=session.get("subject") or "General",
         grade_level=session.get("grade_level") or "Secondary",
         question_count=body.question_count,
+        mcq_instruction=mcq_instruction,
         source_text=source_text[:2000],
     )
 
@@ -311,6 +320,70 @@ async def generate_blueprint(
 
     await asyncio.to_thread(_save_blueprint)
     return {"blueprint_json": blueprint}
+
+
+# ── PATCH /v1/quiz/sessions/{session_id} ─────────────────────────────────────
+
+class PatchSessionRequest(BaseModel):
+    subject: str | None = None
+    grade_level: str | None = None
+    title: str | None = None
+    preset: str | None = None
+
+
+@router.patch("/sessions/{session_id}", summary="Update session metadata")
+async def patch_session(
+    session_id: str,
+    body: PatchSessionRequest,
+    user: Annotated[AuthUser, Depends(require_roles(*_TEACHER_ROLES))],
+) -> dict:
+    await asyncio.to_thread(_require_session, session_id, user.id)
+
+    updates: dict[str, Any] = {}
+    if body.subject is not None:
+        updates["subject"] = body.subject or None
+    if body.grade_level is not None:
+        updates["grade_level"] = body.grade_level or None
+    if body.title is not None:
+        updates["title"] = body.title or None
+    if body.preset is not None:
+        if body.preset not in VALID_PRESETS:
+            raise HTTPException(status_code=400, detail=f"Invalid preset: {body.preset!r}")
+        updates["preset"] = body.preset
+
+    if updates:
+        def _update() -> None:
+            svc = get_service_client()
+            svc.table("quiz_builder_sessions").update(updates).eq("id", session_id).execute()
+        await asyncio.to_thread(_update)
+
+    return {"ok": True}
+
+
+# ── PUT /v1/quiz/sessions/{session_id}/blueprint ──────────────────────────────
+
+class SaveBlueprintRequest(BaseModel):
+    blueprint_json: list[dict]
+
+
+@router.put("/sessions/{session_id}/blueprint", summary="Save blueprint directly (no LLM)")
+async def save_blueprint_direct(
+    session_id: str,
+    body: SaveBlueprintRequest,
+    user: Annotated[AuthUser, Depends(require_roles(*_TEACHER_ROLES))],
+) -> dict:
+    await asyncio.to_thread(_require_session, session_id, user.id)
+
+    def _save() -> None:
+        svc = get_service_client()
+        svc.table("quiz_blueprints").delete().eq("session_id", session_id).execute()
+        svc.table("quiz_blueprints").insert({
+            "session_id": session_id,
+            "blueprint_json": body.blueprint_json,
+        }).execute()
+
+    await asyncio.to_thread(_save)
+    return {"ok": True}
 
 
 # ── POST /v1/quiz/sessions/{session_id}/generate ──────────────────────────────
