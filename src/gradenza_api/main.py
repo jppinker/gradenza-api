@@ -58,6 +58,7 @@ app.add_middleware(
 
 app.include_router(analytics.router)
 app.include_router(class_pdf_notes.router)
+app.include_router(class_pdf_notes.legacy_router)
 app.include_router(materials.router)
 app.include_router(ocr.router)
 app.include_router(submissions.router)

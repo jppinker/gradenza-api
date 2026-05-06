@@ -6,3 +6,5 @@ pydantic-settings>=2.6.0
 supabase>=2.10.0
 redis>=5.2.0
 tenacity>=9.0.0
+playwright>=1.52.0
+mistune>=3.0.0

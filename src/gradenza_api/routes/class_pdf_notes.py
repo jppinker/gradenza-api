@@ -20,12 +20,20 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from gradenza_api.auth import AuthUser, require_roles
+from gradenza_api.services.class_pdf_note_exports import export_note_pdf, get_latest_note_pdf_url
+from gradenza_api.services.class_pdf_note_pdf import (
+    build_class_pdf_note_html,
+    build_export_filename,
+    ensure_note_images_accessible,
+)
 from gradenza_api.services.openrouter import OpenRouterResult, call_openrouter, strip_json_fences
-from gradenza_api.services.supabase_client import get_service_client
+from gradenza_api.services.supabase_client import get_service_client, run_sync
 from gradenza_api.services.usage import AIUsage, record_ai_usage
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/materials/class-pdf-notes", tags=["class-pdf-notes"])
+# Legacy/short paths used by the frontend for export-only endpoints.
+legacy_router = APIRouter(prefix="/class-pdf-notes", tags=["class-pdf-notes"])
 
 PDF_NOTES_MODEL = "google/gemini-2.5-flash"
 CHAT_TEMPERATURE = 0.7
@@ -57,13 +65,14 @@ class ClassPdfNotes(BaseModel):
     sections: list[ClassPdfNotesSection]
     practiceChecklist: list[str]
     studentSummaryMarkdown: str
-    teacherNote: str
 
 
 class ClassPdfNotesChatRequest(BaseModel):
     action: Literal["chat", "generate_pdf_notes", "regenerate_section"]
     messages: list[ContentCreatorMessage] = Field(default_factory=list)
     classContext: dict[str, Any] | None = None
+    noteId: str | None = None
+    promptId: str | None = None
     existingDraft: dict[str, Any] | None = None
     sectionIndex: int | None = None
     sectionFeedback: str | None = None
@@ -74,6 +83,13 @@ class ClassPdfNotesChatResponse(BaseModel):
     text: str | None = None
     notes: ClassPdfNotes | None = None
     model: str | None = None
+
+
+class ExportPdfResponse(BaseModel):
+    pdfUrl: str
+    fileName: str
+    storagePath: str | None = None
+    warnings: list[str] | None = None
 
 
 # ── JSON schema for structured output ────────────────────────────────────────
@@ -107,7 +123,6 @@ _PDF_NOTES_JSON_SCHEMA: dict[str, Any] = {
         },
         "practiceChecklist": {"type": "array", "items": {"type": "string"}},
         "studentSummaryMarkdown": {"type": "string"},
-        "teacherNote": {"type": "string"},
     },
     "required": [
         "schemaVersion",
@@ -118,7 +133,6 @@ _PDF_NOTES_JSON_SCHEMA: dict[str, Any] = {
         "sections",
         "practiceChecklist",
         "studentSummaryMarkdown",
-        "teacherNote",
     ],
     "additionalProperties": False,
 }
@@ -142,7 +156,6 @@ Rules:
 - Use Markdown for all content fields. Use KaTeX-compatible math: \\( inline \\) and \\[ block \\].
 - graphExpressions: plain functions of x only (e.g. "x^2 - 3*x + 2"). No "y=", no LaTeX, no \
 inequalities, no piecewise. Up to 3 per section. Empty array if not needed.
-- teacherNote: teacher-only pedagogy advice, common misconceptions, marking tips. Not for students.
 - learningObjectives: 3–5 bullet-point goals students should achieve.
 - practiceChecklist: 4–6 self-check items students can tick after studying.
 - subtitle: one-line topic summary.
@@ -155,7 +168,7 @@ _REGENERATE_SECTION_SYSTEM = """\
 You are updating one section of an existing class PDF handout. Return the COMPLETE notes JSON \
 with every field preserved from the original — only modify the section at the requested index \
 based on the teacher's feedback. Keep the same number of sections, title, subtitle, objectives, \
-checklist, summary, and teacher note unless the feedback explicitly asks to change them.
+checklist, and summary unless the feedback explicitly asks to change them.
 Return only the JSON object. No markdown fences.
 """
 
@@ -248,6 +261,233 @@ def _format_class_context(ctx: dict[str, Any] | None) -> str:
     return "\n".join(parts)
 
 
+async def _load_note_prompt_id(
+    svc: Any,
+    *,
+    user: AuthUser,
+    note_id: str,
+) -> str | None:
+    """
+    Load `class_pdf_notes.prompt_id` for a note the caller can access.
+
+    - Owner teacher: allowed
+    - Co-teacher: allowed only with accepted + full permission
+    - Internal callers: trusted (no access check)
+    """
+    try:
+        uuid.UUID(note_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid noteId",
+        ) from exc
+
+    def _fetch_note() -> dict | None:
+        result = (
+            svc.table("class_pdf_notes")
+            .select("id,teacher_id,class_id,prompt_id")
+            .eq("id", note_id)
+            .maybe_single()
+            .execute()
+        )
+        return result.data
+
+    note = await run_sync(_fetch_note)
+    if note is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    # Trusted server-to-server caller
+    if user.is_internal:
+        return note.get("prompt_id") or None
+
+    if not user.id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    if note.get("teacher_id") == user.id:
+        return note.get("prompt_id") or None
+
+    class_id = note.get("class_id")
+    if not class_id:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid note")
+
+    def _fetch_co() -> dict | None:
+        result = (
+            svc.table("class_co_teachers")
+            .select("id,permission")
+            .eq("class_id", class_id)
+            .eq("user_id", user.id)
+            .not_.is_("accepted_at", "null")
+            .maybe_single()
+            .execute()
+        )
+        return result.data
+
+    co = await run_sync(_fetch_co)
+    if co is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    if co.get("permission") != "full":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    return note.get("prompt_id") or None
+
+
+async def _load_note_for_export(
+    svc: Any,
+    *,
+    user: AuthUser,
+    note_id: str,
+) -> dict[str, Any]:
+    """
+    Load a Class PDF note row for PDF export with ownership checks.
+
+    Allowed:
+    - owner teacher
+    - full co-teacher (accepted + permission=full)
+    - internal callers
+    """
+    try:
+        uuid.UUID(note_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid noteId",
+        ) from exc
+
+    def _fetch_note() -> dict | None:
+        result = (
+            svc.table("class_pdf_notes")
+            .select("id,teacher_id,class_id,title,subtitle,content")
+            .eq("id", note_id)
+            .maybe_single()
+            .execute()
+        )
+        return result.data
+
+    note = await run_sync(_fetch_note)
+    if note is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    if user.is_internal:
+        return note
+
+    if not user.id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    if note.get("teacher_id") == user.id:
+        return note
+
+    class_id = note.get("class_id")
+    if not class_id:
+        # Avoid leaking existence for personal notes
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    def _fetch_co() -> dict | None:
+        result = (
+            svc.table("class_co_teachers")
+            .select("id,permission")
+            .eq("class_id", class_id)
+            .eq("user_id", user.id)
+            .not_.is_("accepted_at", "null")
+            .maybe_single()
+            .execute()
+        )
+        return result.data
+
+    co = await run_sync(_fetch_co)
+    if co is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    if co.get("permission") != "full":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    return note
+
+
+async def _load_teacher_prompt_text(
+    svc: Any,
+    *,
+    user_id: str,
+    prompt_id: str,
+) -> str | None:
+    """
+    Load a teacher prompt from `materials` and return its content.
+
+    Security: only allows prompts owned by the authenticated user.
+    """
+    try:
+        uuid.UUID(prompt_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid promptId",
+        ) from exc
+
+    def _fetch() -> dict | None:
+        result = (
+            svc.table("materials")
+            .select("id,user_id,source_type,content")
+            .eq("id", prompt_id)
+            .maybe_single()
+            .execute()
+        )
+        return result.data
+
+    row = await run_sync(_fetch)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
+
+    if row.get("source_type") != "teacher_prompt":
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid prompt type")
+
+    if row.get("user_id") != user_id:
+        # Avoid leaking existence across users
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
+
+    content = (row.get("content") or "").strip()
+    return content or None
+
+
+async def _load_teacher_prompt_text_for_note(
+    svc: Any,
+    *,
+    prompt_id: str,
+) -> str | None:
+    """
+    Load a teacher prompt from `materials` and return its content.
+
+    Security: do NOT enforce ownership here. This is intended for prompt IDs already
+    stored on a Class PDF note the caller is authorized to access.
+    """
+    try:
+        uuid.UUID(prompt_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid promptId",
+        ) from exc
+
+    def _fetch() -> dict | None:
+        result = (
+            svc.table("materials")
+            .select("id,source_type,content")
+            .eq("id", prompt_id)
+            .maybe_single()
+            .execute()
+        )
+        return result.data
+
+    row = await run_sync(_fetch)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
+
+    if row.get("source_type") != "teacher_prompt":
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid prompt type")
+
+    content = (row.get("content") or "").strip()
+    return content or None
+
+
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
 
@@ -277,6 +517,43 @@ async def class_pdf_notes_chat(
 
     messages = body.messages[-MAX_MESSAGES:]
     class_context_text = _format_class_context(body.classContext)
+    teacher_prompt_text: str | None = None
+
+    # Source of truth for prompt selection:
+    # - If noteId is provided and the stored note has prompt_id, always use it.
+    # - Otherwise fall back to a caller-provided promptId (owned by the caller).
+    note_prompt_id: str | None = None
+    if body.noteId:
+        try:
+            note_prompt_id = await _load_note_prompt_id(svc, user=user, note_id=body.noteId)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("[class-pdf-notes-chat][%s] note load error: %s", request_id, exc)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to load note",
+            ) from exc
+
+    effective_prompt_id = note_prompt_id or body.promptId
+    if effective_prompt_id:
+        try:
+            if note_prompt_id:
+                teacher_prompt_text = await _load_teacher_prompt_text_for_note(svc, prompt_id=effective_prompt_id)
+            else:
+                teacher_prompt_text = await _load_teacher_prompt_text(
+                    svc,
+                    user_id=user.id or "",
+                    prompt_id=effective_prompt_id,
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("[class-pdf-notes-chat][%s] prompt load error: %s", request_id, exc)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to load prompt",
+            ) from exc
 
     # ── chat ─────────────────────────────────────────────────────
 
@@ -284,6 +561,8 @@ async def class_pdf_notes_chat(
         system = _CHAT_SYSTEM
         if class_context_text:
             system += f"\n\nClass context:\n{class_context_text}"
+        if teacher_prompt_text:
+            system += f"\n\nTeacher prompt / instructions:\n{teacher_prompt_text}"
 
         or_messages = [{"role": "system", "content": system}]
         for m in messages:
@@ -322,6 +601,8 @@ async def class_pdf_notes_chat(
         system = _GENERATE_SYSTEM
         if class_context_text:
             system += f"\n\nClass context:\n{class_context_text}"
+        if teacher_prompt_text:
+            system += f"\n\nTeacher prompt / instructions:\n{teacher_prompt_text}"
 
         or_messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         for m in messages:
@@ -378,6 +659,8 @@ async def class_pdf_notes_chat(
         system = _REGENERATE_SECTION_SYSTEM
         if class_context_text:
             system += f"\n\nClass context:\n{class_context_text}"
+        if teacher_prompt_text:
+            system += f"\n\nTeacher prompt / instructions:\n{teacher_prompt_text}"
 
         draft_json = json.dumps(body.existingDraft, ensure_ascii=False)
         feedback_text = body.sectionFeedback or "Please improve this section."
@@ -452,3 +735,77 @@ async def class_pdf_notes_chat(
         return ClassPdfNotesChatResponse(type="notes", notes=notes, model=result.usage.model)
 
     raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unknown action")
+
+
+@legacy_router.get(
+    "/{note_id}/export-pdf",
+    response_model=ExportPdfResponse,
+    summary="Get the latest exported PDF URL for a note",
+)
+@router.get(
+    "/{note_id}/export-pdf",
+    response_model=ExportPdfResponse,
+    summary="Get the latest exported PDF URL for a note",
+)
+async def class_pdf_note_get_export_pdf(
+    note_id: str,
+    user: Annotated[
+        AuthUser,
+        Depends(require_roles("teacher", "tutor", "co_teacher")),
+    ],
+) -> ExportPdfResponse:
+    svc = get_service_client()
+    # Access check happens here (avoid leaking export existence).
+    await _load_note_for_export(svc, user=user, note_id=note_id)
+
+    existing = await get_latest_note_pdf_url(svc=svc, note_id=note_id)
+    if existing is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
+
+    return ExportPdfResponse(
+        pdfUrl=existing["pdf_url"],
+        fileName=existing.get("file_name") or build_export_filename("class-pdf-note"),
+        storagePath=existing.get("storage_path") or None,
+    )
+
+
+@legacy_router.post(
+    "/{note_id}/export-pdf",
+    response_model=ExportPdfResponse,
+    summary="Export a Class PDF note as a real PDF",
+)
+@router.post(
+    "/{note_id}/export-pdf",
+    response_model=ExportPdfResponse,
+    summary="Export a Class PDF note as a real PDF",
+)
+async def class_pdf_note_export_pdf(
+    note_id: str,
+    user: Annotated[
+        AuthUser,
+        Depends(require_roles("teacher", "tutor", "co_teacher")),
+    ],
+) -> ExportPdfResponse:
+    svc = get_service_client()
+    note = await _load_note_for_export(svc, user=user, note_id=note_id)
+
+    content = note.get("content") or {}
+    if not isinstance(content, dict):
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid note content")
+
+    title = content.get("title") if isinstance(content.get("title"), str) else note.get("title") or "class-pdf-note"
+    file_name = build_export_filename(str(title))
+
+    content_for_pdf = await ensure_note_images_accessible(svc=svc, note_content=content)
+    html_doc = build_class_pdf_note_html(content_for_pdf)
+    result = await export_note_pdf(svc=svc, note_id=note_id, html=html_doc, file_name=file_name)
+
+    if not result.get("pdf_url"):
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate PDF URL")
+
+    return ExportPdfResponse(
+        pdfUrl=result["pdf_url"],
+        fileName=result["file_name"],
+        storagePath=result.get("storage_path") or None,
+        warnings=result.get("warnings") if isinstance(result.get("warnings"), list) else None,
+    )
