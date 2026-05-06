@@ -15,6 +15,7 @@ import logging
 
 from arq.connections import RedisSettings
 
+from gradenza_api.jobs.generate_quiz import generate_quiz
 from gradenza_api.jobs.process_submission import process_submission
 from gradenza_api.settings import settings
 
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 class WorkerSettings:
     """ARQ worker configuration."""
 
-    functions = [process_submission]
+    functions = [generate_quiz, process_submission]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
 
     # How many jobs to run concurrently
