@@ -49,6 +49,7 @@ from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
 from gradenza_api.services.pdf_playwright import render_html_to_pdf_bytes
 from gradenza_api.services.quiz_schemas import QuizQuestionSchema
 from gradenza_api.services.supabase_client import get_service_client
+from gradenza_api.services.usage import AIUsage, record_ai_usage
 from gradenza_api.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -381,11 +382,21 @@ async def generate_blueprint(
         source_text=source_text[:2000],
     )
 
+    svc = get_service_client()
+    ai_usage: AIUsage | None = None
+    _blueprint_route = f"POST /v1/quiz/sessions/{session_id}/blueprint"
     try:
         llm_result = await call_openrouter(
             model=_QUIZ_MODEL,
             temperature=0.3,
             messages=[{"role": "user", "content": prompt}],
+        )
+        ai_usage = AIUsage(
+            prompt_tokens=llm_result.usage.prompt_tokens,
+            completion_tokens=llm_result.usage.completion_tokens,
+            total_tokens=llm_result.usage.total_tokens,
+            model=llm_result.usage.model,
+            request_id=llm_result.usage.request_id,
         )
         raw = strip_json_fences(llm_result.content)
         parsed = json.loads(raw)
@@ -398,9 +409,30 @@ async def generate_blueprint(
             blueprint = []
     except json.JSONDecodeError as exc:
         logger.error("[quiz/blueprint][%s] JSON parse error: %s", session_id, exc)
+        await record_ai_usage(
+            svc,
+            user_id=user.id,
+            source="quiz_builder",
+            entity_type="quiz_session",
+            entity_id=session_id,
+            route=_blueprint_route,
+            usage=ai_usage,
+            status="error",
+            error_message=str(exc),
+        )
         raise HTTPException(status_code=502, detail="Could not parse blueprint from LLM") from exc
     except Exception as exc:
         logger.error("[quiz/blueprint][%s] LLM error: %s", session_id, exc)
+        await record_ai_usage(
+            svc,
+            user_id=user.id,
+            source="quiz_builder",
+            entity_type="quiz_session",
+            entity_id=session_id,
+            route=_blueprint_route,
+            status="error",
+            error_message=str(exc),
+        )
         raise HTTPException(status_code=502, detail="LLM service error") from exc
 
     def _save_blueprint() -> None:
@@ -412,6 +444,15 @@ async def generate_blueprint(
         }).execute()
 
     await asyncio.to_thread(_save_blueprint)
+    await record_ai_usage(
+        svc,
+        user_id=user.id,
+        source="quiz_builder",
+        entity_type="quiz_session",
+        entity_id=session_id,
+        route=_blueprint_route,
+        usage=ai_usage,
+    )
     return {"blueprint_json": blueprint}
 
 
@@ -750,16 +791,37 @@ async def regenerate_question(
         slot=question.get("slot", 1),
     )
 
+    svc_regen = get_service_client()
+    regen_ai_usage: AIUsage | None = None
+    _regen_route = f"POST /v1/quiz/sessions/{session_id}/questions/{question_id}/regenerate"
     try:
         llm_result = await call_openrouter(
             model=_QUIZ_MODEL,
             temperature=0.5,
             messages=[{"role": "user", "content": prompt}],
         )
+        regen_ai_usage = AIUsage(
+            prompt_tokens=llm_result.usage.prompt_tokens,
+            completion_tokens=llm_result.usage.completion_tokens,
+            total_tokens=llm_result.usage.total_tokens,
+            model=llm_result.usage.model,
+            request_id=llm_result.usage.request_id,
+        )
         raw = strip_json_fences(llm_result.content)
         new_qj: dict[str, Any] = QuizQuestionSchema.model_validate(json.loads(raw)).model_dump()
     except Exception as exc:
         logger.error("[quiz/regenerate][%s/%s] error: %s", session_id, question_id, exc)
+        await record_ai_usage(
+            svc_regen,
+            user_id=user.id,
+            source="quiz_builder",
+            entity_type="quiz_question",
+            entity_id=question_id,
+            route=_regen_route,
+            usage=regen_ai_usage,
+            status="error",
+            error_message=str(exc),
+        )
         raise HTTPException(status_code=502, detail="Could not regenerate question") from exc
 
     def _update() -> dict:
@@ -777,7 +839,17 @@ async def regenerate_question(
         )
         return result.data[0] if result.data else {}
 
-    return await asyncio.to_thread(_update)
+    result_row = await asyncio.to_thread(_update)
+    await record_ai_usage(
+        svc_regen,
+        user_id=user.id,
+        source="quiz_builder",
+        entity_type="quiz_question",
+        entity_id=question_id,
+        route=_regen_route,
+        usage=regen_ai_usage,
+    )
+    return result_row
 
 
 # ── POST /v1/quiz/sessions/{session_id}/questions/{question_id}/clone ─────────
@@ -1631,15 +1703,44 @@ async def generate_personalization_summary(
         signals=", ".join(signals),
     )
 
+    svc_pers = get_service_client()
+    _pers_route = f"POST /v1/quiz/sessions/{session_id}/personalization"
+    pers_ai_usage: AIUsage | None = None
     try:
-        result = await call_openrouter(
+        llm_result = await call_openrouter(
             model=_QUIZ_MODEL,
             temperature=0.5,
             messages=[{"role": "user", "content": prompt}],
         )
-        summary = result.content.strip()
+        pers_ai_usage = AIUsage(
+            prompt_tokens=llm_result.usage.prompt_tokens,
+            completion_tokens=llm_result.usage.completion_tokens,
+            total_tokens=llm_result.usage.total_tokens,
+            model=llm_result.usage.model,
+            request_id=llm_result.usage.request_id,
+        )
+        summary = llm_result.content.strip()
+        await record_ai_usage(
+            svc_pers,
+            user_id=user.id,
+            source="quiz_builder",
+            entity_type="quiz_session",
+            entity_id=session_id,
+            route=_pers_route,
+            usage=pers_ai_usage,
+        )
     except Exception as exc:
         logger.error("[quiz/personalization][%s] LLM error: %s", session_id, exc)
+        await record_ai_usage(
+            svc_pers,
+            user_id=user.id,
+            source="quiz_builder",
+            entity_type="quiz_session",
+            entity_id=session_id,
+            route=_pers_route,
+            status="error",
+            error_message=str(exc),
+        )
         summary = (
             f"This student has answered {total} questions with an average score of {avg_pct:.1f}%. "
             "Consider focusing on topics where performance falls below 50%."

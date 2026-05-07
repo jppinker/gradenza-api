@@ -19,6 +19,7 @@ from typing import Any
 from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
 from gradenza_api.services.quiz_schemas import QuizQuestionSchema
 from gradenza_api.services.supabase_client import get_service_client
+from gradenza_api.services.usage import AIUsage, record_ai_usage
 
 logger = logging.getLogger(__name__)
 
@@ -147,17 +148,27 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
         challenge_def=defs["challenge"],
     )
 
+    teacher_id: str = session.get("teacher_id") or ""
+
     def _set_error(msg: str) -> None:
         svc.table("quiz_builder_sessions").update({
             "status": "error",
             "error_message": msg,
         }).eq("id", session_id).execute()
 
+    gen_ai_usage: AIUsage | None = None
     try:
         result = await call_openrouter(
             model=_QUIZ_MODEL,
             temperature=0.4,
             messages=[{"role": "user", "content": prompt}],
+        )
+        gen_ai_usage = AIUsage(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+            model=result.usage.model,
+            request_id=result.usage.request_id,
         )
         raw = strip_json_fences(result.content)
         parsed: list[dict[str, Any]] = json.loads(raw)
@@ -165,6 +176,17 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
             raise ValueError(f"Expected list, got {type(parsed).__name__}")
     except Exception as exc:
         logger.error("[generate_quiz] generation failed session=%s exc=%s", session_id, exc)
+        await record_ai_usage(
+            svc,
+            user_id=teacher_id,
+            source="quiz_builder",
+            entity_type="quiz_session",
+            entity_id=session_id,
+            route="job:generate_quiz",
+            usage=gen_ai_usage,
+            status="error",
+            error_message=str(exc),
+        )
         await asyncio.to_thread(_set_error, str(exc))
         return
 
@@ -198,4 +220,13 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
         svc.table("quiz_builder_sessions").update({"status": "review"}).eq("id", session_id).execute()
 
     await asyncio.to_thread(_save, questions)
+    await record_ai_usage(
+        svc,
+        user_id=teacher_id,
+        source="quiz_builder",
+        entity_type="quiz_session",
+        entity_id=session_id,
+        route="job:generate_quiz",
+        usage=gen_ai_usage,
+    )
     logger.info("[generate_quiz] generation completed session=%s questions=%d", session_id, len(questions))
