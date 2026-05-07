@@ -36,6 +36,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -45,6 +46,7 @@ from pydantic import BaseModel
 
 from gradenza_api.auth import AuthUser, require_roles
 from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
+from gradenza_api.services.pdf_playwright import render_html_to_pdf_bytes
 from gradenza_api.services.quiz_schemas import QuizQuestionSchema
 from gradenza_api.services.supabase_client import get_service_client
 from gradenza_api.settings import settings
@@ -662,6 +664,12 @@ Difficulty definitions — use these when writing the question at the requested 
 - Medium: {medium_def}
 - Challenge: {challenge_def}
 
+Math and scientific notation — apply to ALL fields (question_text, options, correct_answer, explanation):
+- Inline math/formulas/units/symbols: wrap in \\( ... \\) e.g. "The force is \\( F = ma \\)."
+- Standalone display equations: wrap in \\[ ... \\] e.g. \\[ E = mc^2 \\]
+- Use LaTeX syntax: fractions \\frac{{a}}{{b}}, subscripts x_{{n}}, superscripts x^{{n}}, Greek \\alpha \\beta \\gamma, units \\text{{m/s}}.
+- If the subject has no math or science, omit math delimiters entirely.
+
 Generate exactly ONE question matching this spec:
 - question_type: {question_type}
 - difficulty: {difficulty}
@@ -860,12 +868,21 @@ async def remove_question_image(
     session_id: str,
     question_id: str,
     user: Annotated[AuthUser, Depends(require_roles(*_TEACHER_ROLES))],
+    storage_path: Annotated[str | None, Query()] = None,
 ) -> Response:
-    question = await asyncio.to_thread(_require_question, session_id, question_id, user.id)
-
-    qj = question.get("question_json", {})
-    image_slot = qj.get("image_slot")
-    storage_path = (image_slot or {}).get("storage_path") if image_slot else None
+    # storage_path query param: used for orphan cleanup when a file was uploaded but
+    # the follow-up PATCH failed. Must be scoped to this session/question to prevent
+    # deletion of other questions' assets.
+    if storage_path is not None:
+        expected_prefix = f"{session_id}/{question_id}/"
+        if not storage_path.startswith(expected_prefix):
+            raise HTTPException(status_code=403, detail="storage_path out of scope")
+        await asyncio.to_thread(_require_question, session_id, question_id, user.id)
+    else:
+        question = await asyncio.to_thread(_require_question, session_id, question_id, user.id)
+        qj = question.get("question_json", {})
+        image_slot = qj.get("image_slot")
+        storage_path = (image_slot or {}).get("storage_path") if image_slot else None
 
     if storage_path:
         def _remove() -> None:
@@ -909,6 +926,34 @@ def _extract_docx_text(file_bytes: bytes) -> str:
 # ── HTML / Markdown rendering helpers ─────────────────────────────────────────
 
 _ANSWER_LINE_COUNTS: dict[str, int] = {"none": 0, "small": 3, "medium": 6, "large": 12}
+
+# KaTeX CDN assets included in the PDF/preview HTML so math renders before Playwright prints.
+# delimiters match what the LLM is instructed to emit: \( inline \) and \[ display \].
+# window.__PDF_READY is set after renderMathInElement completes; render_html_to_pdf_bytes waits for it.
+_KATEX_HEAD = (
+    '<link rel="stylesheet"'
+    ' href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"'
+    ' crossorigin="anonymous">'
+    '<script defer'
+    ' src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"'
+    ' crossorigin="anonymous"></script>'
+    '<script defer'
+    ' src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"'
+    ' crossorigin="anonymous"></script>'
+    '<script>'
+    'document.addEventListener("DOMContentLoaded",function(){'
+    'if(typeof renderMathInElement==="function"){'
+    'renderMathInElement(document.body,{'
+    'delimiters:[{left:"\\\\[",right:"\\\\]",display:true},'
+    '{left:"\\\\(",right:"\\\\)",display:false}],'
+    'throwOnError:false});'
+    '}else{'
+    '(window.__PDF_WARNINGS=window.__PDF_WARNINGS||[]).push("KaTeX auto-render not loaded");'
+    '}'
+    'window.__PDF_READY=true;'
+    '});'
+    '</script>'
+)
 
 
 def _h(v: object) -> str:
@@ -1066,6 +1111,9 @@ def _render_question_html(
         html += f'<div class="teacher-answer">Answer: {correct}</div>'
         if explanation:
             html += f'<div class="teacher-answer">Explanation: {explanation}</div>'
+        rubric = _h(qj.get("rubric") or "")
+        if rubric:
+            html += f'<div class="teacher-answer">Rubric: {rubric}</div>'
 
     html += "</div>"
     return html
@@ -1113,7 +1161,9 @@ def _generate_quiz_html(
 
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
-        f"<style>{css}</style></head><body>"
+        f"<style>{css}</style>"
+        f"{_KATEX_HEAD}"
+        f"</head><body>"
         f"{header}<div class='questions'>{qs_html}</div></body></html>"
     )
 
@@ -1132,6 +1182,7 @@ def _generate_quiz_markdown(
         lines.append(f"**Subject:** {subject}")
     lines.append("")
 
+    sid = session.get("id") or ""
     sorted_qs = sorted(questions, key=lambda q: q.get("slot", 99))
     for i, q in enumerate(sorted_qs):
         qj = q.get("question_json", {})
@@ -1143,14 +1194,32 @@ def _generate_quiz_markdown(
         correct = qj.get("correct_answer", "")
         explanation = qj.get("explanation", "")
 
+        raw_slot = qj.get("image_slot")
+        image_slot: dict = raw_slot if isinstance(raw_slot, dict) else {}
+        img_url = image_slot.get("url", "")
+        img_caption = image_slot.get("caption", "")
+        img_pos = image_slot.get("position", "above")
+        qid = q.get("id") or ""
+        img_md = (
+            f"![{img_caption}]({img_url})"
+            if img_url and _is_quiz_image_url(img_url, sid, qid)
+            else ""
+        )
+
         lines.append(f"## {q_num}. {text}  *[{marks} mark{'s' if marks != 1 else ''}]*")
         lines.append("")
+        if img_md and img_pos == "above":
+            lines.append(img_md)
+            lines.append("")
         if q_type == "multiple_choice" and options:
             for opt in options:
                 lines.append(f"- {opt}")
             lines.append("")
         else:
             lines.append("_" * 60)
+            lines.append("")
+        if img_md and img_pos != "above":
+            lines.append(img_md)
             lines.append("")
         if is_teacher:
             lines.append(f"> **Answer:** {correct}")
@@ -1249,21 +1318,9 @@ async def export_pdf(
     config = (render_row or {}).get("config", {})
     html = _generate_quiz_html(session, questions, template_id, config, body.version)
 
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        page = await browser.new_page()
-        await page.set_content(html, wait_until="networkidle")
-        pdf_bytes: bytes = await page.pdf(format="A4", print_background=True)
-        await browser.close()
+    pdf_bytes, pdf_warnings = await render_html_to_pdf_bytes(html)
+    if pdf_warnings:
+        logger.warning("[quiz/export_pdf][%s] PDF warnings: %s", session_id, pdf_warnings)
 
     file_id = body.render_id or str(uuid.uuid4())
     storage_path = f"{session_id}/{file_id}_{body.version}.pdf"

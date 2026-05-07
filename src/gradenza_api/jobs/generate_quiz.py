@@ -47,6 +47,12 @@ Difficulty definitions — apply these when generating questions at each level:
 - Medium: {medium_def}
 - Challenge: {challenge_def}
 
+Math and scientific notation — apply to ALL fields (question_text, options, correct_answer, explanation, rubric):
+- Inline math/formulas/units/symbols: wrap in \\( ... \\) e.g. "The force is \\( F = ma \\)."
+- Standalone display equations: wrap in \\[ ... \\] e.g. \\[ E = mc^2 \\]
+- Use LaTeX syntax: fractions \\frac{{a}}{{b}}, subscripts x_{{n}}, superscripts x^{{n}}, Greek \\alpha \\beta \\gamma, units \\text{{m/s}}.
+- If the subject has no math or science, omit math delimiters entirely.
+
 Blueprint — generate EXACTLY these questions:
 {blueprint}
 
