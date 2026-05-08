@@ -1,9 +1,9 @@
-"""Pydantic schema for LLM-generated quiz question JSON."""
+"""Pydantic schema for LLM-generated quiz JSON."""
 
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -57,3 +57,29 @@ class QuizQuestionSchema(BaseModel):
         return self
 
     model_config = {"extra": "allow"}
+
+
+class QuizBlueprintItemSchema(BaseModel):
+    slot: int = Field(..., ge=1)
+    question_type: Literal["multiple_choice", "fill_blank", "short_answer", "long_answer"]
+    difficulty: Literal["easy", "medium", "challenge"]
+    marks: int = Field(..., ge=1, le=5)
+
+    model_config = {"extra": "forbid"}
+
+
+def validate_quiz_blueprint_items(items: Any, *, expected_count: int) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        raise ValueError(f"Expected blueprint JSON array, got {type(items).__name__}")
+    if len(items) != expected_count:
+        raise ValueError(f"Expected {expected_count} blueprint items, got {len(items)}")
+
+    validated = [QuizBlueprintItemSchema.model_validate(it).model_dump() for it in items]
+
+    slots = [it["slot"] for it in validated]
+    if len(set(slots)) != len(slots):
+        raise ValueError("Blueprint slot values must be unique")
+    if sorted(slots) != list(range(1, expected_count + 1)):
+        raise ValueError(f"Blueprint slot values must be 1..{expected_count}")
+
+    return sorted(validated, key=lambda x: x["slot"])

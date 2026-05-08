@@ -23,6 +23,7 @@ DELETE /v1/quiz/sessions/{session_id}/questions/{question_id}/image   remove ima
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import html as _html
 import json
 import logging
@@ -47,7 +48,14 @@ from pydantic import BaseModel
 from gradenza_api.auth import AuthUser, require_roles
 from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
 from gradenza_api.services.pdf_playwright import render_html_to_pdf_bytes
-from gradenza_api.services.quiz_schemas import QuizQuestionSchema
+from gradenza_api.services.llm_structured import (
+    StructuredJSONError,
+    call_openrouter_structured_json,
+)
+from gradenza_api.services.quiz_schemas import (
+    QuizQuestionSchema,
+    validate_quiz_blueprint_items,
+)
 from gradenza_api.services.supabase_client import get_service_client
 from gradenza_api.services.usage import AIUsage, record_ai_usage
 from gradenza_api.settings import settings
@@ -383,44 +391,102 @@ async def generate_blueprint(
     )
 
     svc = get_service_client()
-    ai_usage: AIUsage | None = None
     _blueprint_route = f"POST /v1/quiz/sessions/{session_id}/blueprint"
-    try:
-        llm_result = await call_openrouter(
-            model=_QUIZ_MODEL,
-            temperature=0.3,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        ai_usage = AIUsage(
-            prompt_tokens=llm_result.usage.prompt_tokens,
-            completion_tokens=llm_result.usage.completion_tokens,
-            total_tokens=llm_result.usage.total_tokens,
-            model=llm_result.usage.model,
-            request_id=llm_result.usage.request_id,
-        )
-        raw = strip_json_fences(llm_result.content)
-        parsed = json.loads(raw)
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "quiz_blueprint",
+            "strict": True,
+            "schema": {
+                "type": "array",
+                "minItems": body.question_count,
+                "maxItems": body.question_count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "slot": {"type": "integer", "minimum": 1},
+                        "question_type": {
+                            "type": "string",
+                            "enum": ["multiple_choice", "fill_blank", "short_answer", "long_answer"],
+                        },
+                        "difficulty": {"type": "string", "enum": ["easy", "medium", "challenge"]},
+                        "marks": {"type": "integer", "minimum": 1, "maximum": 5},
+                    },
+                    "required": ["slot", "question_type", "difficulty", "marks"],
+                },
+            },
+        },
+    }
 
-        if isinstance(parsed, list):
-            blueprint: list[dict] = parsed
-        elif isinstance(parsed, dict):
-            blueprint = next((v for v in parsed.values() if isinstance(v, list)), [])
-        else:
-            blueprint = []
-    except json.JSONDecodeError as exc:
-        logger.error("[quiz/blueprint][%s] JSON parse error: %s", session_id, exc)
-        await record_ai_usage(
-            svc,
-            user_id=user.id,
-            source="quiz_builder",
-            entity_type="quiz_session",
-            entity_id=session_id,
-            route=_blueprint_route,
-            usage=ai_usage,
-            status="error",
-            error_message=str(exc),
+    base_messages = [
+        {
+            "role": "system",
+            "content": "Return only valid JSON matching the requested schema. No markdown fences, no prose.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+    retry_instruction = (
+        "Your previous response was not valid JSON or did not match the required schema. "
+        f"Return ONLY a JSON array of exactly {body.question_count} objects with keys "
+        '"slot","question_type","difficulty","marks". Do not include any other text. '
+        "Do not change the educational intent of the blueprint beyond what is necessary to satisfy the schema."
+    )
+
+    try:
+        structured = await call_openrouter_structured_json(
+            model=_QUIZ_MODEL,
+            base_messages=base_messages,
+            response_format=response_format,
+            temperature_first=0.15,
+            temperature_retry=0.0,
+            retry_user_instruction=retry_instruction,
+            validator=lambda parsed: validate_quiz_blueprint_items(parsed, expected_count=body.question_count),
+            logger=logger,
+            log_context=f"[quiz/blueprint][{session_id}]",
         )
-        raise HTTPException(status_code=502, detail="Could not parse blueprint from LLM") from exc
+        blueprint = structured.value
+        for att in structured.attempts:
+            usage = AIUsage(
+                prompt_tokens=att.llm_result.usage.prompt_tokens,
+                completion_tokens=att.llm_result.usage.completion_tokens,
+                total_tokens=att.llm_result.usage.total_tokens,
+                model=att.llm_result.usage.model,
+                request_id=att.llm_result.usage.request_id,
+            )
+            await record_ai_usage(
+                svc,
+                user_id=user.id,
+                source="quiz_builder",
+                entity_type="quiz_session",
+                entity_id=session_id,
+                route=_blueprint_route,
+                usage=usage,
+                status="success" if att.status == "success" else "error",
+                error_message=None if att.status == "success" else (att.error_message or att.status),
+            )
+    except StructuredJSONError as exc:
+        logger.error("[quiz/blueprint][%s] structured output failed: %s", session_id, exc)
+        for att in getattr(exc, "attempts", []) or []:
+            usage = AIUsage(
+                prompt_tokens=att.llm_result.usage.prompt_tokens,
+                completion_tokens=att.llm_result.usage.completion_tokens,
+                total_tokens=att.llm_result.usage.total_tokens,
+                model=att.llm_result.usage.model,
+                request_id=att.llm_result.usage.request_id,
+            )
+            await record_ai_usage(
+                svc,
+                user_id=user.id,
+                source="quiz_builder",
+                entity_type="quiz_session",
+                entity_id=session_id,
+                route=_blueprint_route,
+                usage=usage,
+                status="error",
+                error_message=att.error_message or att.status,
+            )
+        raise HTTPException(status_code=502, detail="Could not create question plan. Please try again.") from exc
     except Exception as exc:
         logger.error("[quiz/blueprint][%s] LLM error: %s", session_id, exc)
         await record_ai_usage(
@@ -444,15 +510,6 @@ async def generate_blueprint(
         }).execute()
 
     await asyncio.to_thread(_save_blueprint)
-    await record_ai_usage(
-        svc,
-        user_id=user.id,
-        source="quiz_builder",
-        entity_type="quiz_session",
-        entity_id=session_id,
-        route=_blueprint_route,
-        usage=ai_usage,
-    )
     return {"blueprint_json": blueprint}
 
 
@@ -536,25 +593,83 @@ async def start_generation(
     request: Request,
     user: Annotated[AuthUser, Depends(require_roles(*_TEACHER_ROLES))],
 ) -> dict:
-    await asyncio.to_thread(_require_session, session_id, user.id)
+    session = await asyncio.to_thread(_require_session, session_id, user.id)
 
-    def _set_generating() -> None:
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _parse_ts(ts: str | None) -> datetime | None:
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    # Keep aligned with frontend stuck detection (NewSessionWizard) to avoid UI showing "stuck"
+    # before the backend considers the job stale and eligible for retry/reset.
+    GENERATION_STALE_SECONDS = 6 * 60  # must be < worker job_timeout (10 min)
+
+    def _is_stale(sess: dict) -> bool:
+        last = _parse_ts(sess.get("updated_at")) or _parse_ts(sess.get("generation_started_at"))
+        if not last:
+            return False
+        age_s = (datetime.now(timezone.utc) - last).total_seconds()
+        return age_s >= GENERATION_STALE_SECONDS
+
+    in_progress = (session.get("generation_status") in {"queued", "generating"}) or (session.get("status") == "generating")
+    stale = in_progress and _is_stale(session)
+    if in_progress and not stale:
+        logger.info(
+            "[quiz/generate] rejected duplicate session=%s gen_status=%s gen_stage=%s job_id=%s",
+            session_id,
+            session.get("generation_status"),
+            session.get("generation_stage"),
+            session.get("generation_job_id"),
+        )
+        return {"enqueued": False, "already_running": True, "session_id": session_id, "job_id": session.get("generation_job_id")}
+
+    redis = request.app.state.redis
+    old_job_id = session.get("generation_job_id")
+    if stale and old_job_id:
+        try:
+            from arq.jobs import Job
+
+            aborted = await Job(job_id=old_job_id, redis=redis).abort(timeout=0.5)
+            logger.warning("[quiz/generate] stale generation abort attempted session=%s old_job_id=%s aborted=%s", session_id, old_job_id, aborted)
+        except Exception as exc:
+            logger.warning("[quiz/generate] stale generation abort failed session=%s old_job_id=%s exc=%s", session_id, old_job_id, exc)
+
+    now_iso = _now_iso()
+    attempt = int(session.get("generation_attempt_count") or 0) + 1
+    job_id = f"quiz_{session_id}_{attempt}"
+
+    def _set_queued() -> None:
         svc = get_service_client()
         svc.table("quiz_builder_sessions").update({
             "status": "generating",
+            "error_message": None,
+            "generation_status": "queued",
+            "generation_stage": "queued",
+            "generation_job_id": job_id,
+            "generation_attempt_count": attempt,
+            "generation_started_at": now_iso,
+            "generation_completed_at": None,
+            "generation_failed_at": None,
+            "generation_error_code": None,
+            "generation_error_message": None,
+            "updated_at": now_iso,
         }).eq("id", session_id).execute()
 
-    await asyncio.to_thread(_set_generating)
+    await asyncio.to_thread(_set_queued)
 
-    redis = request.app.state.redis
-    await redis.enqueue_job(
-        "generate_quiz",
-        session_id=session_id,
-        _job_id=f"quiz_{session_id}",
-    )
+    enqueued_job = await redis.enqueue_job("generate_quiz", session_id=session_id, _job_id=job_id)
+    if enqueued_job is None:
+        logger.info("[quiz/generate] enqueue returned None (duplicate job_id) session=%s job_id=%s", session_id, job_id)
+        return {"enqueued": False, "already_running": True, "session_id": session_id, "job_id": job_id}
 
-    logger.info("[quiz/generate] enqueued session=%s", session_id)
-    return {"enqueued": True, "session_id": session_id}
+    logger.info("[quiz/generate] enqueued session=%s job_id=%s attempt=%d", session_id, job_id, attempt)
+    return {"enqueued": True, "session_id": session_id, "job_id": job_id}
 
 
 # ── Question helpers ───────────────────────────────────────────────────────────
@@ -705,11 +820,17 @@ Difficulty definitions — use these when writing the question at the requested 
 - Medium: {medium_def}
 - Challenge: {challenge_def}
 
-Math and scientific notation — apply to ALL fields (question_text, options, correct_answer, explanation):
-- Inline math/formulas/units/symbols: wrap in \\( ... \\) e.g. "The force is \\( F = ma \\)."
-- Standalone display equations: wrap in \\[ ... \\] e.g. \\[ E = mc^2 \\]
-- Use LaTeX syntax: fractions \\frac{{a}}{{b}}, subscripts x_{{n}}, superscripts x^{{n}}, Greek \\alpha \\beta \\gamma, units \\text{{m/s}}.
-- If the subject has no math or science, omit math delimiters entirely.
+LaTeX / KaTeX math & scientific notation (store LaTeX source text, not HTML) — REQUIRED whenever the source or question contains formula-like notation (even if Subject is "General").
+Apply to ALL fields: question_text/options/correct_answer/acceptable_answers/explanation/rubric.
+At minimum, question_text/options/correct_answer/explanation/rubric must follow these rules.
+- Delimiters in the stored text: \\( ... \\) for inline, \\[ ... \\] for display.
+- JSON escaping: you are returning JSON, so backslashes must be escaped. In your JSON output strings write \\\\( ... \\\\) and \\\\[ ... \\\\].
+  Example JSON string value: "\\\\( \\\\frac{{d}}{{dx}}\\\\sin x = \\\\cos x \\\\)"
+- Convert EVERY formula-like snippet (derivative, integral, limit, equation, symbol expression, unit expression, exponent/subscript, trig identity, scientific notation) into KaTeX-compatible LaTeX and wrap it in delimiters. Do NOT leave ASCII math.
+- Forbidden ASCII math examples (do not output these): d/dx sin(x) = cos(x); sin^2(x) + cos^2(x) = 1
+  Required LaTeX (stored text): \\( \\frac{{d}}{{dx}}\\sin x = \\cos x \\); \\( \\sin^2 x + \\cos^2 x = 1 \\)
+- Use LaTeX syntax (KaTeX-friendly): fractions \\frac{{a}}{{b}}, roots \\sqrt{{x}}, subscripts x_{{n}}, superscripts x^{{n}}, Greek \\alpha \\beta \\gamma, multiplication \\times or \\cdot, units \\text{{m/s}}.
+- Never output HTML tags (e.g., <span>...</span>) or KaTeX/MathJax-generated HTML; only LaTeX source inside delimiters.
 
 Generate exactly ONE question matching this spec:
 - question_type: {question_type}
@@ -721,8 +842,8 @@ Return a single JSON object (not an array) with this schema:
 "bloom_level": "remember"|"understand"|"apply"|"analyse"|"evaluate"|"create", \
 "question_text": "<full question text>", \
 "options": ["A. ...", "B. ...", "C. ...", "D. ..."] for MC else null, \
-"correct_answer": "<answer>", "acceptable_answers": null, "explanation": "<brief explanation>", \
-"marks": {marks}, "rubric": null, \
+"correct_answer": "<answer>", "acceptable_answers": ["<alt answer>"] or null, "explanation": "<brief explanation>", \
+"marks": {marks}, "rubric": "<rubric for long_answer>" or null, \
 "answer_space": "multiple_choice"|"single_line"|"short_paragraph"|"long_paragraph", \
 "source_reference": null, "image_slot": null}}
 

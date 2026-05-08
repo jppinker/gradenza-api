@@ -17,29 +17,58 @@ from gradenza_api.routes.quiz import (
 
 # ── Prompt instructions ──────────────────────────────────────────────────────
 
-
-def test_generate_prompt_has_inline_delimiter_instruction():
-    assert r"\( ... \)" in _GENERATE_PROMPT or "\\\\(" in _GENERATE_PROMPT or "\\(" in _GENERATE_PROMPT
-
-
-def test_generate_prompt_has_display_delimiter_instruction():
-    assert r"\[ ... \]" in _GENERATE_PROMPT or "\\\\[" in _GENERATE_PROMPT or "\\[" in _GENERATE_PROMPT
-
-
-def test_generate_prompt_covers_all_fields():
-    """Prompt must mention all output fields that can contain math."""
-    lower = _GENERATE_PROMPT.lower()
-    assert "question_text" in lower
-    assert "explanation" in lower
-    assert "options" in lower
+def _format_generate_prompt_for_test() -> str:
+    return _GENERATE_PROMPT.format(
+        subject="General",
+        grade_level="Secondary",
+        mode="from_source",
+        preset="quick_check",
+        source_text="Example source with math.",
+        easy_def="Easy def",
+        medium_def="Medium def",
+        challenge_def="Challenge def",
+        blueprint="[]",
+    )
 
 
-def test_regenerate_prompt_has_latex_instructions():
-    assert "\\(" in _REGENERATE_PROMPT or "\\\\(" in _REGENERATE_PROMPT
+def _format_regenerate_prompt_for_test() -> str:
+    return _REGENERATE_PROMPT.format(
+        subject="General",
+        grade_level="Secondary",
+        mode="from_source",
+        preset="quick_check",
+        source_text="Example source with math.",
+        easy_def="Easy def",
+        medium_def="Medium def",
+        challenge_def="Challenge def",
+        question_type="short_answer",
+        difficulty="medium",
+        marks=2,
+        slot=1,
+    )
 
 
-def test_regenerate_prompt_has_display_delimiter():
-    assert "\\[" in _REGENERATE_PROMPT or "\\\\[" in _REGENERATE_PROMPT
+def _assert_prompt_requires_latex(prompt: str) -> None:
+    lower = prompt.lower()
+    assert r"\( ... \)" in prompt
+    assert r"\[ ... \]" in prompt
+    assert "question_text/options/correct_answer/explanation/rubric" in lower
+
+    for field in ("question_text", "options", "correct_answer", "acceptable_answers", "explanation", "rubric"):
+        assert field in lower
+
+    assert "d/dx sin(x) = cos(x)" in prompt
+    assert r"\( \frac{d}{dx}\sin x = \cos x \)" in prompt
+    assert "sin^2(x) + cos^2(x) = 1" in prompt
+    assert r"\( \sin^2 x + \cos^2 x = 1 \)" in prompt
+
+
+def test_generate_prompt_requires_katex_latex():
+    _assert_prompt_requires_latex(_format_generate_prompt_for_test())
+
+
+def test_regenerate_prompt_requires_katex_latex():
+    _assert_prompt_requires_latex(_format_regenerate_prompt_for_test())
 
 
 # ── HTML escaping preserves LaTeX delimiters ─────────────────────────────────

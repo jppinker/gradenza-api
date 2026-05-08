@@ -14,8 +14,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
+from pydantic import ValidationError
+
+from gradenza_api.services.llm_structured import (
+    StructuredJSONError,
+    call_openrouter_structured_json,
+)
 from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
 from gradenza_api.services.quiz_schemas import QuizQuestionSchema
 from gradenza_api.services.supabase_client import get_service_client
@@ -48,11 +55,17 @@ Difficulty definitions — apply these when generating questions at each level:
 - Medium: {medium_def}
 - Challenge: {challenge_def}
 
-Math and scientific notation — apply to ALL fields (question_text, options, correct_answer, explanation, rubric):
-- Inline math/formulas/units/symbols: wrap in \\( ... \\) e.g. "The force is \\( F = ma \\)."
-- Standalone display equations: wrap in \\[ ... \\] e.g. \\[ E = mc^2 \\]
-- Use LaTeX syntax: fractions \\frac{{a}}{{b}}, subscripts x_{{n}}, superscripts x^{{n}}, Greek \\alpha \\beta \\gamma, units \\text{{m/s}}.
-- If the subject has no math or science, omit math delimiters entirely.
+LaTeX / KaTeX math & scientific notation (store LaTeX source text, not HTML) — REQUIRED whenever the source or question contains formula-like notation (even if Subject is "General").
+Apply to ALL fields: question_text/options/correct_answer/acceptable_answers/explanation/rubric.
+At minimum, question_text/options/correct_answer/explanation/rubric must follow these rules.
+- Delimiters in the stored text: \\( ... \\) for inline, \\[ ... \\] for display.
+- JSON escaping: you are returning JSON, so backslashes must be escaped. In your JSON output strings write \\\\( ... \\\\) and \\\\[ ... \\\\].
+  Example JSON string value: "\\\\( \\\\frac{{d}}{{dx}}\\\\sin x = \\\\cos x \\\\)"
+- Convert EVERY formula-like snippet (derivative, integral, limit, equation, symbol expression, unit expression, exponent/subscript, trig identity, scientific notation) into KaTeX-compatible LaTeX and wrap it in delimiters. Do NOT leave ASCII math.
+- Forbidden ASCII math examples (do not output these): d/dx sin(x) = cos(x); sin^2(x) + cos^2(x) = 1
+  Required LaTeX (stored text): \\( \\frac{{d}}{{dx}}\\sin x = \\cos x \\); \\( \\sin^2 x + \\cos^2 x = 1 \\)
+- Use LaTeX syntax (KaTeX-friendly): fractions \\frac{{a}}{{b}}, roots \\sqrt{{x}}, subscripts x_{{n}}, superscripts x^{{n}}, Greek \\alpha \\beta \\gamma, multiplication \\times or \\cdot, units \\text{{m/s}}.
+- Never output HTML tags (e.g., <span>...</span>) or KaTeX/MathJax-generated HTML; only LaTeX source inside delimiters.
 
 Blueprint — generate EXACTLY these questions:
 {blueprint}
@@ -82,13 +95,33 @@ Return ONLY the raw JSON array. No markdown fences, no explanation."""
 
 
 async def generate_quiz(ctx: dict, *, session_id: str) -> None:
-    logger.info("[generate_quiz] job started session=%s", session_id)
+    job_id = str(ctx.get("job_id") or "")
+    logger.info("[generate_quiz] job started session=%s job_id=%s", session_id, job_id)
     svc = get_service_client()
 
-    def _set_generating() -> None:
-        svc.table("quiz_builder_sessions").update({"status": "generating", "error_message": None}).eq("id", session_id).execute()
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
 
-    await asyncio.to_thread(_set_generating)
+    def _touch_session(updates: dict[str, Any]) -> None:
+        svc.table("quiz_builder_sessions").update({**updates, "updated_at": _now_iso()}).eq("id", session_id).execute()
+
+    def _still_current_job() -> bool:
+        """Check whether this worker's job_id still matches the session's generation_job_id.
+
+        This MUST be checked before any terminal/destructive writes (failed/completed, or
+        deleting/inserting quiz_questions) to prevent superseded workers from overwriting retries.
+        """
+        if not job_id:
+            return True
+        current = (
+            svc.table("quiz_builder_sessions")
+            .select("generation_job_id")
+            .eq("id", session_id)
+            .maybe_single()
+            .execute()
+        ).data
+        current_job_id = str((current or {}).get("generation_job_id") or "")
+        return current_job_id == job_id
 
     def _fetch() -> tuple[dict | None, dict | None, dict | None]:
         sess = (
@@ -124,8 +157,29 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
     session, source, blueprint = await asyncio.to_thread(_fetch)
 
     if not session:
-        logger.error("[generate_quiz] session not found session=%s", session_id)
+        logger.error("[generate_quiz] session not found session=%s job_id=%s", session_id, job_id)
         return
+
+    current_job_id = str(session.get("generation_job_id") or "")
+    if current_job_id and job_id and current_job_id != job_id:
+        logger.info(
+            "[generate_quiz] superseded job ignored session=%s job_id=%s current_job_id=%s",
+            session_id,
+            job_id,
+            current_job_id,
+        )
+        return
+
+    await asyncio.to_thread(_touch_session, {
+        "status": "generating",
+        "error_message": None,
+        "generation_status": "generating",
+        "generation_stage": "preparing_source",
+        "generation_failed_at": None,
+        "generation_completed_at": None,
+        "generation_error_code": None,
+        "generation_error_message": None,
+    })
 
     source_text: str = (source or {}).get("extracted_text") or "(no source text provided)"
     blueprint_items: list[Any] = (blueprint or {}).get("blueprint_json") or []
@@ -150,32 +204,172 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
 
     teacher_id: str = session.get("teacher_id") or ""
 
-    def _set_error(msg: str) -> None:
-        svc.table("quiz_builder_sessions").update({
-            "status": "error",
-            "error_message": msg,
-        }).eq("id", session_id).execute()
-
-    gen_ai_usage: AIUsage | None = None
     try:
-        result = await call_openrouter(
+        expected_count = len(blueprint_items)
+
+        def _summarize_validation_error(exc: ValidationError) -> str:
+            try:
+                first = (exc.errors() or [{}])[0]
+                loc = ".".join(str(p) for p in first.get("loc", []) if p is not None) or "unknown"
+                typ = first.get("type") or "validation_error"
+                msg = first.get("msg") or "invalid value"
+                return f"{loc}: {msg} ({typ})"
+            except Exception:
+                return "validation_error"
+
+        def _validate_questions(obj: Any) -> list[dict[str, Any]]:
+            if not isinstance(obj, list):
+                raise ValueError(f"Expected JSON array of questions, got {type(obj).__name__}")
+            if len(obj) != expected_count:
+                raise ValueError(f"Expected {expected_count} questions, got {len(obj)}")
+            out: list[dict[str, Any]] = []
+            for i, q in enumerate(obj):
+                try:
+                    out.append(QuizQuestionSchema.model_validate(q).model_dump())
+                except ValidationError as exc:
+                    raise ValueError(f"Question {i} failed schema validation: {_summarize_validation_error(exc)}") from exc
+            return out
+
+        await asyncio.to_thread(_touch_session, {"generation_stage": "calling_llm"})
+
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "quiz_questions",
+                "strict": True,
+                "schema": {
+                    "type": "array",
+                    "minItems": expected_count,
+                    "maxItems": expected_count,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "slot": {"type": "integer", "minimum": 1},
+                            "question_type": {
+                                "type": "string",
+                                "enum": ["multiple_choice", "fill_blank", "short_answer", "long_answer"],
+                            },
+                            "difficulty": {"type": "string", "enum": ["easy", "medium", "challenge"]},
+                            "bloom_level": {
+                                "type": "string",
+                                "enum": ["remember", "understand", "apply", "analyse", "evaluate", "create"],
+                            },
+                            "question_text": {"type": "string", "minLength": 1},
+                            "options": {"type": ["array", "null"], "items": {"type": "string"}},
+                            "correct_answer": {"type": "string", "minLength": 1},
+                            "acceptable_answers": {"type": ["array", "null"], "items": {"type": "string"}},
+                            "explanation": {"type": "string", "minLength": 1},
+                            "marks": {"type": "integer", "minimum": 1, "maximum": 5},
+                            "rubric": {"type": ["string", "null"]},
+                            "answer_space": {
+                                "type": "string",
+                                "enum": ["multiple_choice", "single_line", "short_paragraph", "long_paragraph"],
+                            },
+                            "source_reference": {"type": ["string", "null"]},
+                            "image_slot": {"type": "null"},
+                        },
+                        "required": [
+                            "slot",
+                            "question_type",
+                            "difficulty",
+                            "bloom_level",
+                            "question_text",
+                            "options",
+                            "correct_answer",
+                            "acceptable_answers",
+                            "explanation",
+                            "marks",
+                            "rubric",
+                            "answer_space",
+                            "source_reference",
+                            "image_slot",
+                        ],
+                    },
+                },
+            },
+        }
+
+        base_messages = [
+            {"role": "system", "content": "Return only valid JSON matching the required schema. No markdown fences, no prose."},
+            {"role": "user", "content": prompt},
+        ]
+        retry_instruction = (
+            "Your previous response was not valid JSON or did not match the required schema. "
+            "Fix only the JSON formatting/structure and field values needed for schema compliance; "
+            "do not change the educational content beyond what is necessary. "
+            "Return ONLY the JSON array."
+        )
+
+        structured = await call_openrouter_structured_json(
             model=_QUIZ_MODEL,
-            temperature=0.4,
-            messages=[{"role": "user", "content": prompt}],
+            base_messages=base_messages,
+            response_format=response_format,
+            temperature_first=0.15,
+            temperature_retry=0.0,
+            retry_user_instruction=retry_instruction,
+            validator=_validate_questions,
+            logger=logger,
+            log_context=f"[generate_quiz][{session_id}]",
         )
-        gen_ai_usage = AIUsage(
-            prompt_tokens=result.usage.prompt_tokens,
-            completion_tokens=result.usage.completion_tokens,
-            total_tokens=result.usage.total_tokens,
-            model=result.usage.model,
-            request_id=result.usage.request_id,
-        )
-        raw = strip_json_fences(result.content)
-        parsed: list[dict[str, Any]] = json.loads(raw)
-        if not isinstance(parsed, list):
-            raise ValueError(f"Expected list, got {type(parsed).__name__}")
+        await asyncio.to_thread(_touch_session, {"generation_stage": "parsing_response"})
+        questions = structured.value
+        for att in structured.attempts:
+            usage = AIUsage(
+                prompt_tokens=att.llm_result.usage.prompt_tokens,
+                completion_tokens=att.llm_result.usage.completion_tokens,
+                total_tokens=att.llm_result.usage.total_tokens,
+                model=att.llm_result.usage.model,
+                request_id=att.llm_result.usage.request_id,
+            )
+            await record_ai_usage(
+                svc,
+                user_id=teacher_id,
+                source="quiz_builder",
+                entity_type="quiz_session",
+                entity_id=session_id,
+                route="job:generate_quiz",
+                usage=usage,
+                status="success" if att.status == "success" else "error",
+                error_message=None if att.status == "success" else (att.error_message or att.status),
+            )
+    except StructuredJSONError as exc:
+        logger.error("[generate_quiz] structured output failed session=%s job_id=%s err=%s", session_id, job_id, exc)
+        for att in getattr(exc, "attempts", []) or []:
+            usage = AIUsage(
+                prompt_tokens=att.llm_result.usage.prompt_tokens,
+                completion_tokens=att.llm_result.usage.completion_tokens,
+                total_tokens=att.llm_result.usage.total_tokens,
+                model=att.llm_result.usage.model,
+                request_id=att.llm_result.usage.request_id,
+            )
+            await record_ai_usage(
+                svc,
+                user_id=teacher_id,
+                source="quiz_builder",
+                entity_type="quiz_session",
+                entity_id=session_id,
+                route="job:generate_quiz",
+                usage=usage,
+                status="error",
+                error_message=att.error_message or att.status,
+            )
+        internal_msg = str(getattr(exc, "last_exc", None) or exc)[:300]
+        if not await asyncio.to_thread(_still_current_job):
+            logger.info("[generate_quiz] superseded before failing session=%s job_id=%s", session_id, job_id)
+            return
+        await asyncio.to_thread(_touch_session, {
+            "status": "error",
+            "error_message": internal_msg or "LLM structured output failed",
+            "generation_status": "failed",
+            "generation_stage": "failed",
+            "generation_failed_at": _now_iso(),
+            "generation_error_code": "structured_output_error",
+            "generation_error_message": internal_msg or "structured_output_error",
+        })
+        return
     except Exception as exc:
-        logger.error("[generate_quiz] generation failed session=%s exc=%s", session_id, exc)
+        logger.error("[generate_quiz] generation failed session=%s job_id=%s exc=%s", session_id, job_id, exc)
         await record_ai_usage(
             svc,
             user_id=teacher_id,
@@ -183,27 +377,31 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
             entity_type="quiz_session",
             entity_id=session_id,
             route="job:generate_quiz",
-            usage=gen_ai_usage,
             status="error",
             error_message=str(exc),
         )
-        await asyncio.to_thread(_set_error, str(exc))
-        return
-
-    questions: list[dict[str, Any]] = []
-    for i, q in enumerate(parsed):
-        try:
-            validated = QuizQuestionSchema.model_validate(q)
-            questions.append(validated.model_dump())
-        except Exception as exc:
-            logger.warning("[generate_quiz] question %d failed schema validation session=%s exc=%s", i, session_id, exc)
-
-    if not questions:
-        logger.error("[generate_quiz] all questions failed schema validation session=%s", session_id)
-        await asyncio.to_thread(_set_error, "All generated questions failed schema validation")
+        if not await asyncio.to_thread(_still_current_job):
+            logger.info("[generate_quiz] superseded before failing session=%s job_id=%s", session_id, job_id)
+            return
+        await asyncio.to_thread(_touch_session, {
+            "status": "error",
+            "error_message": "LLM service error",
+            "generation_status": "failed",
+            "generation_stage": "failed",
+            "generation_failed_at": _now_iso(),
+            "generation_error_code": "llm_service_error",
+            "generation_error_message": str(exc)[:300],
+        })
         return
 
     def _save(qs: list[dict[str, Any]]) -> None:
+        if not _still_current_job():
+            logger.info("[generate_quiz] superseded before saving questions session=%s job_id=%s", session_id, job_id)
+            return
+        _touch_session({"generation_stage": "saving_questions"})
+        if not _still_current_job():
+            logger.info("[generate_quiz] superseded before question delete/insert session=%s job_id=%s", session_id, job_id)
+            return
         svc.table("quiz_questions").delete().eq("session_id", session_id).execute()
         if qs:
             svc.table("quiz_questions").insert([
@@ -217,16 +415,15 @@ async def generate_quiz(ctx: dict, *, session_id: str) -> None:
                 }
                 for i, q in enumerate(qs)
             ]).execute()
-        svc.table("quiz_builder_sessions").update({"status": "review"}).eq("id", session_id).execute()
+        if not _still_current_job():
+            logger.info("[generate_quiz] superseded before completing session=%s job_id=%s", session_id, job_id)
+            return
+        _touch_session({
+            "status": "review",
+            "generation_status": "completed",
+            "generation_stage": "completed",
+            "generation_completed_at": _now_iso(),
+        })
 
     await asyncio.to_thread(_save, questions)
-    await record_ai_usage(
-        svc,
-        user_id=teacher_id,
-        source="quiz_builder",
-        entity_type="quiz_session",
-        entity_id=session_id,
-        route="job:generate_quiz",
-        usage=gen_ai_usage,
-    )
-    logger.info("[generate_quiz] generation completed session=%s questions=%d", session_id, len(questions))
+    logger.info("[generate_quiz] generation completed session=%s job_id=%s questions=%d", session_id, job_id, len(questions))
