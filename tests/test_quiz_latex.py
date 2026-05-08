@@ -45,6 +45,8 @@ def _format_regenerate_prompt_for_test() -> str:
         difficulty="medium",
         marks=2,
         slot=1,
+        current_question_json='{"question_type": "short_answer", "difficulty": "medium"}',
+        clarifying_prompt_section="",
     )
 
 

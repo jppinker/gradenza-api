@@ -832,22 +832,77 @@ At minimum, question_text/options/correct_answer/explanation/rubric must follow 
 - Use LaTeX syntax (KaTeX-friendly): fractions \\frac{{a}}{{b}}, roots \\sqrt{{x}}, subscripts x_{{n}}, superscripts x^{{n}}, Greek \\alpha \\beta \\gamma, multiplication \\times or \\cdot, units \\text{{m/s}}.
 - Never output HTML tags (e.g., <span>...</span>) or KaTeX/MathJax-generated HTML; only LaTeX source inside delimiters.
 
-Generate exactly ONE question matching this spec:
-- question_type: {question_type}
-- difficulty: {difficulty}
-- marks: {marks}
+Current question being replaced:
+{current_question_json}
+
+Keep slot={slot} fixed. For question_type, difficulty, and marks, use the defaults below; defer to the teacher's instruction if it explicitly requests a different value for any of these.
+{clarifying_prompt_section}
+Generate exactly ONE question. Teacher's instruction above overrides any of these defaults:
+- slot: {slot} (never change)
+- question_type: {question_type} (default; override if teacher requests)
+- difficulty: {difficulty} (default; override if teacher requests)
+- marks: {marks} (default; override if teacher requests)
 
 Return a single JSON object (not an array) with this schema:
-{{"slot": {slot}, "question_type": "{question_type}", "difficulty": "{difficulty}", \
+{{"slot": {slot}, \
+"question_type": "multiple_choice"|"fill_blank"|"short_answer"|"long_answer", \
+"difficulty": "easy"|"medium"|"challenge", \
 "bloom_level": "remember"|"understand"|"apply"|"analyse"|"evaluate"|"create", \
 "question_text": "<full question text>", \
 "options": ["A. ...", "B. ...", "C. ...", "D. ..."] for MC else null, \
 "correct_answer": "<answer>", "acceptable_answers": ["<alt answer>"] or null, "explanation": "<brief explanation>", \
-"marks": {marks}, "rubric": "<rubric for long_answer>" or null, \
+"marks": <integer 1-5>, "rubric": "<rubric for long_answer>" or null, \
 "answer_space": "multiple_choice"|"single_line"|"short_paragraph"|"long_paragraph", \
 "source_reference": null, "image_slot": null}}
 
 Return ONLY the raw JSON object. No markdown, no explanation."""
+
+
+class RegenerateRequest(BaseModel):
+    clarifying_prompt: str | None = None
+
+
+_REGEN_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "quiz_question",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "slot": {"type": "integer", "minimum": 1},
+                "question_type": {
+                    "type": "string",
+                    "enum": ["multiple_choice", "fill_blank", "short_answer", "long_answer"],
+                },
+                "difficulty": {"type": "string", "enum": ["easy", "medium", "challenge"]},
+                "bloom_level": {
+                    "type": "string",
+                    "enum": ["remember", "understand", "apply", "analyse", "evaluate", "create"],
+                },
+                "question_text": {"type": "string", "minLength": 1},
+                "options": {"type": ["array", "null"], "items": {"type": "string"}},
+                "correct_answer": {"type": "string", "minLength": 1},
+                "acceptable_answers": {"type": ["array", "null"], "items": {"type": "string"}},
+                "explanation": {"type": "string", "minLength": 1},
+                "marks": {"type": "integer", "minimum": 1, "maximum": 5},
+                "rubric": {"type": ["string", "null"]},
+                "answer_space": {
+                    "type": "string",
+                    "enum": ["multiple_choice", "single_line", "short_paragraph", "long_paragraph"],
+                },
+                "source_reference": {"type": ["string", "null"]},
+                "image_slot": {"type": "null"},
+            },
+            "required": [
+                "slot", "question_type", "difficulty", "bloom_level", "question_text",
+                "options", "correct_answer", "acceptable_answers", "explanation",
+                "marks", "rubric", "answer_space", "source_reference", "image_slot",
+            ],
+        },
+    },
+}
 
 
 @router.post(
@@ -858,9 +913,15 @@ async def regenerate_question(
     session_id: str,
     question_id: str,
     user: Annotated[AuthUser, Depends(require_roles(*_TEACHER_ROLES))],
+    body: RegenerateRequest | None = None,
 ) -> dict:
     question = await asyncio.to_thread(_require_question, session_id, question_id, user.id)
     session = await asyncio.to_thread(_require_session, session_id, user.id)
+
+    clarifying_prompt: str | None = None
+    if body is not None and body.clarifying_prompt:
+        cp = body.clarifying_prompt.strip()[:1000]
+        clarifying_prompt = cp if cp else None
 
     def _get_source() -> dict | None:
         svc = get_service_client()
@@ -897,6 +958,12 @@ async def regenerate_question(
     }
 
     qj = question.get("question_json", {})
+    current_question_json = json.dumps(qj, indent=2, ensure_ascii=False)
+    clarifying_prompt_section = (
+        f"Teacher's instruction: {clarifying_prompt}\n\n"
+        if clarifying_prompt
+        else ""
+    )
     prompt = _REGENERATE_PROMPT.format(
         subject=session.get("subject") or "General",
         grade_level=session.get("grade_level") or "Secondary",
@@ -910,26 +977,77 @@ async def regenerate_question(
         difficulty=qj.get("difficulty", "medium"),
         marks=qj.get("marks", 2),
         slot=question.get("slot", 1),
+        current_question_json=current_question_json,
+        clarifying_prompt_section=clarifying_prompt_section,
     )
 
     svc_regen = get_service_client()
-    regen_ai_usage: AIUsage | None = None
     _regen_route = f"POST /v1/quiz/sessions/{session_id}/questions/{question_id}/regenerate"
+    base_messages = [
+        {"role": "system", "content": "Return only valid JSON matching the required schema. No markdown fences, no prose."},
+        {"role": "user", "content": prompt},
+    ]
+    retry_instruction = (
+        "Your previous response failed JSON/schema validation. "
+        "Fix only the JSON formatting/structure and field values needed for schema compliance; "
+        "do not change the educational content beyond what is necessary. "
+        "Return ONLY the corrected JSON object."
+    )
+
     try:
-        llm_result = await call_openrouter(
+        structured = await call_openrouter_structured_json(
             model=_QUIZ_MODEL,
-            temperature=0.5,
-            messages=[{"role": "user", "content": prompt}],
+            base_messages=base_messages,
+            response_format=_REGEN_RESPONSE_FORMAT,
+            temperature_first=0.3,
+            temperature_retry=0.0,
+            retry_user_instruction=retry_instruction,
+            validator=lambda parsed: QuizQuestionSchema.model_validate(parsed).model_dump(),
+            logger=logger,
+            log_context=f"[quiz/regenerate][{session_id}/{question_id}]",
         )
-        regen_ai_usage = AIUsage(
-            prompt_tokens=llm_result.usage.prompt_tokens,
-            completion_tokens=llm_result.usage.completion_tokens,
-            total_tokens=llm_result.usage.total_tokens,
-            model=llm_result.usage.model,
-            request_id=llm_result.usage.request_id,
-        )
-        raw = strip_json_fences(llm_result.content)
-        new_qj: dict[str, Any] = QuizQuestionSchema.model_validate(json.loads(raw)).model_dump()
+        new_qj: dict[str, Any] = structured.value
+        for att in structured.attempts:
+            usage = AIUsage(
+                prompt_tokens=att.llm_result.usage.prompt_tokens,
+                completion_tokens=att.llm_result.usage.completion_tokens,
+                total_tokens=att.llm_result.usage.total_tokens,
+                model=att.llm_result.usage.model,
+                request_id=att.llm_result.usage.request_id,
+            )
+            await record_ai_usage(
+                svc_regen,
+                user_id=user.id,
+                source="quiz_builder",
+                entity_type="quiz_question",
+                entity_id=question_id,
+                route=_regen_route,
+                usage=usage,
+                status="success" if att.status == "success" else "error",
+                error_message=None if att.status == "success" else (att.error_message or att.status),
+            )
+    except StructuredJSONError as exc:
+        logger.error("[quiz/regenerate][%s/%s] structured output failed: %s", session_id, question_id, exc)
+        for att in getattr(exc, "attempts", []) or []:
+            usage = AIUsage(
+                prompt_tokens=att.llm_result.usage.prompt_tokens,
+                completion_tokens=att.llm_result.usage.completion_tokens,
+                total_tokens=att.llm_result.usage.total_tokens,
+                model=att.llm_result.usage.model,
+                request_id=att.llm_result.usage.request_id,
+            )
+            await record_ai_usage(
+                svc_regen,
+                user_id=user.id,
+                source="quiz_builder",
+                entity_type="quiz_question",
+                entity_id=question_id,
+                route=_regen_route,
+                usage=usage,
+                status="error",
+                error_message=att.error_message or att.status,
+            )
+        raise HTTPException(status_code=502, detail="Could not regenerate question") from exc
     except Exception as exc:
         logger.error("[quiz/regenerate][%s/%s] error: %s", session_id, question_id, exc)
         await record_ai_usage(
@@ -939,7 +1057,6 @@ async def regenerate_question(
             entity_type="quiz_question",
             entity_id=question_id,
             route=_regen_route,
-            usage=regen_ai_usage,
             status="error",
             error_message=str(exc),
         )
@@ -960,17 +1077,7 @@ async def regenerate_question(
         )
         return result.data[0] if result.data else {}
 
-    result_row = await asyncio.to_thread(_update)
-    await record_ai_usage(
-        svc_regen,
-        user_id=user.id,
-        source="quiz_builder",
-        entity_type="quiz_question",
-        entity_id=question_id,
-        route=_regen_route,
-        usage=regen_ai_usage,
-    )
-    return result_row
+    return await asyncio.to_thread(_update)
 
 
 # ── POST /v1/quiz/sessions/{session_id}/questions/{question_id}/clone ─────────
