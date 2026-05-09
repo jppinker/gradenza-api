@@ -13,7 +13,7 @@ from arq.connections import RedisSettings
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from gradenza_api.routes import analytics, class_pdf_notes, materials, ocr, quiz, submissions
+from gradenza_api.routes import analytics, canvas_chat, class_pdf_notes, materials, ocr, quiz, submissions
 from gradenza_api.services.pdf_playwright import get_playwright_runtime_diagnostics
 from gradenza_api.settings import settings
 
@@ -75,6 +75,7 @@ app.add_middleware(
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 app.include_router(analytics.router)
+app.include_router(canvas_chat.router)
 app.include_router(class_pdf_notes.router)
 app.include_router(class_pdf_notes.legacy_router)
 app.include_router(materials.router)
