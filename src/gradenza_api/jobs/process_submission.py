@@ -260,6 +260,74 @@ class ParsedQuestion:
     assignment_question_id: str
 
 
+# ── Quiz question fetcher (3a) ────────────────────────────────────────────────
+
+def _fetch_quiz_question_row(source_id: str) -> dict | None:
+    """Fetch a quiz_questions row by UUID (used as source_id)."""
+    svc = get_service_client()
+    result = (
+        svc.table("quiz_questions")
+        .select("id, question_json, teacher_approved")
+        .eq("id", source_id)
+        .maybe_single()
+        .execute()
+    )
+    return result.data
+
+
+# ── Quiz ParsedQuestion builder (3b) ─────────────────────────────────────────
+
+def _parsed_question_from_quiz_json(
+    qj: dict,
+    assignment_question_id: str,
+    question_uuid: str,
+    source_id: str,
+) -> "ParsedQuestion":
+    """Convert a quiz_questions.question_json dict into a ParsedQuestion."""
+    q_type     = qj.get("question_type") or "short_answer"
+    marks      = int(qj.get("marks") or 1)
+    q_text     = qj.get("question_text") or ""
+    options    = qj.get("options") or []
+    correct    = qj.get("correct_answer") or ""
+    expl       = qj.get("explanation") or ""
+    acceptable = qj.get("acceptable_answers") or ""
+
+    if q_type == "multiple_choice" and options:
+        opts_text = "\n".join(options)
+        problem_text = f"{q_text}\n\n{opts_text}"
+    else:
+        problem_text = q_text
+
+    if q_type == "multiple_choice":
+        ms_text = f"Correct answer: {correct}."
+        if expl:
+            ms_text += f" {expl}"
+    else:
+        ms_text = expl or acceptable or "(See explanation)"
+        if acceptable and acceptable != expl:
+            ms_text += f"\nAcceptable answers: {acceptable}"
+
+    step = ParsedMarkschemeStep(
+        part_label=None,
+        description=ms_text,
+        marks=marks,
+        mark_type=None,
+    )
+
+    return ParsedQuestion(
+        question_uuid=question_uuid,
+        source_id=source_id,
+        problem_text=problem_text,
+        parts=[],
+        markscheme_steps=[step],
+        marks_available=marks,
+        diagram_required=bool(qj.get("image_slot")),
+        ft_eligible_parts=[],
+        ft_dependencies={},
+        assignment_question_id=assignment_question_id,
+    )
+
+
 # ── Parsing helpers ───────────────────────────────────────────────────────────
 
 def _parse_parts(raw: Any) -> list[ParsedPart]:
@@ -918,6 +986,24 @@ async def process_submission(
         source_id: str = str(q_row.get("source_id") or "")
         if not source_id:
             logger.warning("[job] question %s has no source_id", q_row.get("id"))
+            continue
+
+        # ── 3c: Quiz questions dispatch ───────────────────────────
+        if source_table == "quiz_questions":
+            raw_quiz_row = await asyncio.to_thread(_fetch_quiz_question_row, source_id)
+            if not raw_quiz_row:
+                logger.warning(
+                    "[job] quiz_question not found for source_id=%s", source_id
+                )
+                continue
+            question_json = raw_quiz_row.get("question_json") or {}
+            parsed = _parsed_question_from_quiz_json(
+                qj=question_json,
+                assignment_question_id=str(aq["id"]),
+                question_uuid=str(q_row.get("id")),
+                source_id=source_id,
+            )
+            questions.append(parsed)
             continue
 
         def _fetch_ib_row(sid: str) -> dict | None:
