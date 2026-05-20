@@ -630,6 +630,11 @@ async def start_generation(
         return {"enqueued": False, "already_running": True, "session_id": session_id, "job_id": session.get("generation_job_id")}
 
     redis = request.app.state.redis
+    if redis is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Background queue temporarily unavailable. Please retry shortly.",
+        )
     old_job_id = session.get("generation_job_id")
     if stale and old_job_id:
         try:

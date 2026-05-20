@@ -158,7 +158,12 @@ async def process_submission(
             )
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="assignment_question_id mismatch")
 
-    redis: ArqRedis = request.app.state.redis
+    redis: ArqRedis | None = request.app.state.redis
+    if redis is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Background queue temporarily unavailable. Please retry shortly.",
+        )
     job_id = f"process_submission_{submission_id}"
 
     job = await redis.enqueue_job(
