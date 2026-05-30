@@ -11,10 +11,10 @@ from typing import AsyncGenerator
 from urllib.parse import urlparse
 
 from arq import create_pool
-from arq.connections import RedisSettings
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from gradenza_api.redis_config import build_redis_settings
 from gradenza_api.routes import analytics, canvas_chat, class_pdf_notes, materials, ocr, quiz, submissions
 from gradenza_api.services.pdf_playwright import get_playwright_runtime_diagnostics
 from gradenza_api.settings import settings
@@ -40,7 +40,7 @@ async def _connect_redis_with_retry(app: FastAPI) -> None:
     while True:
         try:
             logger.info("[app] connecting to Redis at %s", _safe_redis_url(settings.redis_url))
-            pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+            pool = await create_pool(build_redis_settings())
             app.state.redis = pool
             logger.info("[app] Redis pool ready")
             return
