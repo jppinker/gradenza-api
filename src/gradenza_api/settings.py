@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     # Storage
     submission_photos_bucket: str = "submission-photos"
 
+    # ── Online lesson AI models ────────────────────────────────────────────────
+    # All online-lesson AI calls use the stable Gemini 2.5 Flash model.
+    # google/gemini-2.5-flash-preview-05-20 is no longer available on OpenRouter.
+    online_lesson_chat_model: str = "google/gemini-2.5-flash"
+    online_lesson_plan_model: str = "google/gemini-2.5-flash"
+    online_lesson_revise_model: str = "google/gemini-2.5-flash"
+    online_lesson_questions_model: str = "google/gemini-2.5-flash"
+
     @property
     def origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
