@@ -1823,3 +1823,528 @@ async def generate_practice_questions(
         lesson_title=lesson.get("title") or "",
         source_meta=source_meta,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Generate homework questions
+# ══════════════════════════════════════════════════════════════════════════════
+
+GENERATE_HOMEWORK_TEMPERATURE = 0.6
+
+# ── Homework-specific JSON schema (extends practice schema with HW fields) ────
+
+_HOMEWORK_QUESTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["questions"],
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "slot", "title", "question_type", "difficulty", "marks",
+                    "estimated_time_minutes", "question_text", "options",
+                    "correct_answer", "worked_solution", "markscheme_steps",
+                    "common_mistakes", "hints", "tags", "domain", "topic",
+                    "subtopic", "exam_system", "subject", "level",
+                    "source_lesson_plan_excerpt", "quality_notes",
+                    "similar_to_practice_slots", "variation_notes",
+                ],
+                "properties": {
+                    "slot":                       {"type": "integer"},
+                    "title":                      {"type": "string"},
+                    "question_type":              {"type": "string", "enum": ["multiple_choice", "short_answer", "long_answer", "fill_blank"]},
+                    "difficulty":                 {"type": "string", "enum": ["easy", "medium", "challenge"]},
+                    "marks":                      {"type": "integer"},
+                    "estimated_time_minutes":     {"type": "integer"},
+                    "question_text":              {"type": "string"},
+                    "options":                    {"type": "array", "items": {"type": "string"}},
+                    "correct_answer":             {"type": "string"},
+                    "worked_solution":            {"type": "string"},
+                    "markscheme_steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["description", "marks"],
+                            "properties": {
+                                "description": {"type": "string"},
+                                "marks":       {"type": "integer"},
+                            },
+                        },
+                    },
+                    "common_mistakes":            {"type": "array", "items": {"type": "string"}},
+                    "hints":                      {"type": "array", "items": {"type": "string"}},
+                    "tags":                       {"type": "array", "items": {"type": "string"}},
+                    "domain":                     {"type": "string"},
+                    "topic":                      {"type": "string"},
+                    "subtopic":                   {"type": "string"},
+                    "exam_system":                {"type": "string"},
+                    "subject":                    {"type": "string"},
+                    "level":                      {"type": "string"},
+                    "source_lesson_plan_excerpt": {"type": "string"},
+                    "quality_notes":              {"type": "string"},
+                    # Homework-specific fields
+                    "similar_to_practice_slots":  {"type": "array", "items": {"type": "integer"}},
+                    "variation_notes":             {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+
+# ── Homework question Pydantic model ──────────────────────────────────────────
+
+class HomeworkQuestion(BaseModel):
+    slot: int
+    title: str = ""
+    question_type: str
+    difficulty: str
+    marks: int = Field(default=2, ge=1, le=20)
+    estimated_time_minutes: int = Field(default=3, ge=1, le=60)
+    question_text: str
+    options: list[str] = Field(default_factory=list)
+    correct_answer: str = ""
+    worked_solution: str = ""
+    markscheme_steps: list[MarkschemeStep] = Field(default_factory=list)
+    common_mistakes: list[str] = Field(default_factory=list)
+    hints: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    domain: str = ""
+    topic: str = ""
+    subtopic: str = ""
+    exam_system: str = ""
+    subject: str = ""
+    level: str = ""
+    source_lesson_plan_excerpt: str = ""
+    quality_notes: str = ""
+    # Homework-specific
+    similar_to_practice_slots: list[int] = Field(default_factory=list)
+    variation_notes: str = ""
+
+
+# ── Input / output models ─────────────────────────────────────────────────────
+
+class HomeworkOptions(BaseModel):
+    difficulty_mode: str = "same"   # same | easier | harder | mixed
+    type_mode: str = "same"          # same | more_mcq | more_written | mixed
+    include_worked_solutions: bool = True
+    include_markscheme: bool = True
+
+
+class PracticeQuestionSummary(BaseModel):
+    """Minimal shape accepted from Next.js; extra fields are silently ignored."""
+    slot: int
+    question_type: str = ""
+    difficulty: str = ""
+    question_text: str = ""
+    correct_answer: str = ""
+    marks: int = 1
+    topic: str = ""
+    subtopic: str = ""
+
+
+class GenerateHomeworkRequest(BaseModel):
+    lesson_id: str
+    lesson_plan: str = Field(..., min_length=1)
+    lesson_title: str = ""
+    practice_questions: list[PracticeQuestionSummary] = Field(default_factory=list)
+    practice_material_id: str | None = None
+    teacher_prompt: str = Field(default="", max_length=2000)
+    question_count: int = Field(default=5, ge=1, le=20)
+    homework_options: HomeworkOptions = Field(default_factory=HomeworkOptions)
+    exclude_questions: list[str] = Field(default_factory=list)
+
+
+class GenerateHomeworkResponse(BaseModel):
+    questions: list[HomeworkQuestion]
+    lesson_title: str = ""
+    source_meta: dict[str, Any] = Field(default_factory=dict)
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+_GENERATE_HOMEWORK_SYSTEM = """\
+You are an expert assessment designer creating homework questions for students after an online lesson.
+
+You have been given:
+1. The approved lesson plan for this lesson.
+2. The practice questions used during the lesson (which the students have already seen).
+3. A teacher prompt (which may customise the homework).
+
+Your task: generate NEW homework questions that reinforce the same learning objectives as the practice
+questions, but are NOT copies. Each homework question must differ in at least one of:
+- The numbers or values used.
+- The context or scenario framing.
+- The specific sub-skill tested (e.g. factoring vs. expanding for the same algebra topic).
+- The representation (graph vs. table, numeric vs. algebraic).
+- The direction of reasoning (e.g. given result → find method, vs. given method → find result).
+
+Your output MUST be a single JSON object: {"questions": [<question objects>]}
+
+Each question object must contain ALL of these fields with the correct types:
+
+{
+  "slot": <integer — question number, starting at 1>,
+  "title": "<concise title describing what the question tests — 4–10 words>",
+  "question_type": "multiple_choice" | "short_answer" | "long_answer" | "fill_blank",
+  "difficulty": "easy" | "medium" | "challenge",
+  "marks": <integer 1–10>,
+  "estimated_time_minutes": <integer 1–15>,
+  "question_text": "<complete, self-contained question — include all information needed to answer>",
+  "options": ["A. ...", "B. ...", "C. ...", "D. ..."] for multiple_choice, [] for all other types,
+  "correct_answer": "<for MCQ: the letter only, e.g. 'B'; for other types: full model answer>",
+  "worked_solution": "<complete step-by-step worked solution>",
+  "markscheme_steps": [{"description": "<what earns this mark>", "marks": <integer>}, ...],
+  "common_mistakes": ["<mistake 1>", "<mistake 2>"],
+  "hints": ["<hint 1>"],
+  "tags": ["<tag 1>", "<tag 2>", "<tag 3>"],
+  "domain": "<curriculum domain or unit>",
+  "topic": "<specific topic>",
+  "subtopic": "<subtopic or empty string>",
+  "exam_system": "<exam system or empty string>",
+  "subject": "<subject or empty string>",
+  "level": "<level/tier or empty string>",
+  "source_lesson_plan_excerpt": "<15–30 verbatim words from the lesson plan that this question tests>",
+  "quality_notes": "<1-sentence note on why this question is good>",
+  "similar_to_practice_slots": [<slot numbers of practice questions that inspired this homework question>],
+  "variation_notes": "<1–2 sentences explaining how this homework question differs from the practice question(s)>"
+}
+
+Quality rules — follow these strictly:
+- Do NOT copy practice question text, numbers, answer choices, or solution structure.
+- similar_to_practice_slots must reference at least one practice slot (the inspiration) even when varied significantly.
+- variation_notes must name the specific variation: "Changed from factoring to expanding.", "Used a different context (chemistry instead of physics).", etc.
+- markscheme_steps marks must SUM to the total marks value.
+- Math notation: use LaTeX; in JSON strings escape backslashes: \\\\( inline \\\\) and \\\\[ display \\\\].
+- MCQ: exactly 4 options (A–D). Each distractor must be a plausible misconception — not random wrong answers.
+- worked_solution: show every step.
+- options: always use [] for non-MCQ questions.
+
+Return ONLY the JSON object. No markdown fences, no preamble, no postamble.
+"""
+
+
+def _build_homework_context(
+    lesson_plan: str,
+    practice_questions: list[PracticeQuestionSummary],
+    homework_options: HomeworkOptions,
+    teacher_prompt: str,
+    question_count: int,
+    exclude_questions: list[str],
+) -> tuple[str, str]:
+    """
+    Build system suffix and user message for homework generation.
+    Returns (system_suffix, user_message).
+    """
+    # Format practice questions as context
+    pq_lines: list[str] = []
+    for pq in practice_questions:
+        pq_lines.append(
+            f"[Slot {pq.slot}] ({pq.question_type}, {pq.difficulty}, {pq.marks}m)"
+            f" {pq.question_text.strip()[:300]}"
+        )
+        if pq.correct_answer.strip():
+            pq_lines.append(f"  Answer: {pq.correct_answer.strip()[:120]}")
+        if pq.topic:
+            pq_lines.append(f"  Topic: {pq.topic}")
+
+    pq_block = "\n".join(pq_lines) if pq_lines else "No practice questions available."
+
+    # Difficulty and type guidance
+    diff_guidance = {
+        "same": "Match the difficulty levels of the practice questions.",
+        "easier": "Make questions slightly easier than the practice questions — one step simpler in reasoning.",
+        "harder": "Make questions slightly harder than the practice questions — one step deeper in reasoning.",
+        "mixed": "Use a balanced mix of easy, medium, and challenge questions.",
+    }.get(homework_options.difficulty_mode, "Match the difficulty levels of the practice questions.")
+
+    type_guidance = {
+        "same": "Use the same question type distribution as the practice questions.",
+        "more_mcq": "Use more multiple choice questions than the practice set.",
+        "more_written": "Use more short_answer and long_answer questions than the practice set.",
+        "mixed": "Use a balanced mix of question types.",
+    }.get(homework_options.type_mode, "Use the same question type distribution as the practice questions.")
+
+    system_suffix = (
+        f"\n\n## Approved lesson plan\n{lesson_plan[:5000]}"
+        f"\n\n## Practice questions used in the lesson (DO NOT COPY these)\n{pq_block}"
+        f"\n\n## Homework generation rules\n"
+        f"- Difficulty: {diff_guidance}\n"
+        f"- Question types: {type_guidance}\n"
+        f"- Worked solutions: {'Include full step-by-step worked solutions.' if homework_options.include_worked_solutions else 'Brief answer only (no worked solution).'}\n"
+        f"- Markscheme: {'Include detailed markscheme steps.' if homework_options.include_markscheme else 'Omit markscheme steps (empty array).'}"
+    )
+
+    teacher_instruction = teacher_prompt.strip()
+    if not teacher_instruction:
+        teacher_instruction = (
+            "Generate a homework assignment with similar questions to the practice questions we used in this lesson."
+        )
+
+    user_msg = (
+        f"{teacher_instruction}\n\n"
+        f"Generate exactly {question_count} homework question"
+        f"{'s' if question_count != 1 else ''}."
+    )
+
+    if exclude_questions:
+        excluded = "\n".join(f"- {q}" for q in exclude_questions[:20])
+        user_msg += f"\n\nDo NOT reuse or closely paraphrase any of these questions:\n{excluded}"
+
+    return system_suffix, user_msg
+
+
+def _repair_homework_question(qr: Any, slot: int) -> HomeworkQuestion:
+    """Parse and repair a raw homework question dict, filling gaps with safe defaults."""
+    if not isinstance(qr, dict):
+        return HomeworkQuestion(
+            slot=slot, question_type="short_answer", difficulty="medium",
+            question_text=f"Question {slot}", marks=2,
+        )
+
+    # Reuse the practice question repair for shared fields
+    base = _repair_question(qr, slot)
+
+    def _int_list(val: Any) -> list[int]:
+        if isinstance(val, list):
+            result = []
+            for v in val:
+                try:
+                    result.append(int(v))
+                except (TypeError, ValueError):
+                    pass
+            return result
+        return []
+
+    return HomeworkQuestion(
+        slot=base.slot,
+        title=base.title,
+        question_type=base.question_type,
+        difficulty=base.difficulty,
+        marks=base.marks,
+        estimated_time_minutes=base.estimated_time_minutes,
+        question_text=base.question_text,
+        options=base.options,
+        correct_answer=base.correct_answer,
+        worked_solution=base.worked_solution,
+        markscheme_steps=base.markscheme_steps,
+        common_mistakes=base.common_mistakes,
+        hints=base.hints,
+        tags=base.tags,
+        domain=base.domain,
+        topic=base.topic,
+        subtopic=base.subtopic,
+        exam_system=base.exam_system,
+        subject=base.subject,
+        level=base.level,
+        source_lesson_plan_excerpt=base.source_lesson_plan_excerpt,
+        quality_notes=base.quality_notes,
+        similar_to_practice_slots=_int_list(qr.get("similar_to_practice_slots")),
+        variation_notes=str(qr.get("variation_notes") or "").strip(),
+    )
+
+
+async def _call_with_structured_homework(
+    messages: list[dict[str, Any]],
+    model: str,
+) -> tuple[list[Any], Any]:
+    """
+    Call OpenRouter for homework generation, cascading through JSON modes.
+    Returns (questions_raw_list, result).
+    """
+    # Attempt 1: strict JSON schema
+    try:
+        result = await call_openrouter(
+            model=model,
+            messages=messages,
+            temperature=GENERATE_HOMEWORK_TEMPERATURE,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "homework_questions",
+                    "strict": True,
+                    "schema": _HOMEWORK_QUESTION_SCHEMA,
+                },
+            },
+        )
+        parsed = json.loads(strip_json_fences(result.content or ""))
+        if isinstance(parsed, dict) and isinstance(parsed.get("questions"), list):
+            return parsed["questions"], result
+        if isinstance(parsed, list):
+            return parsed, result
+    except Exception as exc:
+        logger.warning("[generate-homework] strict schema attempt failed: %s", exc)
+
+    # Attempt 2: json_object mode
+    try:
+        result = await call_openrouter(
+            model=model,
+            messages=messages,
+            temperature=GENERATE_HOMEWORK_TEMPERATURE,
+            response_format={"type": "json_object"},
+        )
+        parsed = json.loads(strip_json_fences(result.content or ""))
+        if isinstance(parsed, dict) and isinstance(parsed.get("questions"), list):
+            return parsed["questions"], result
+        if isinstance(parsed, list):
+            return parsed, result
+    except Exception as exc:
+        logger.warning("[generate-homework] json_object attempt failed: %s", exc)
+
+    # Attempt 3: plain call + parse
+    result = await call_openrouter(
+        model=model,
+        messages=messages,
+        temperature=GENERATE_HOMEWORK_TEMPERATURE,
+    )
+    raw = strip_json_fences(result.content or "")
+    parsed = json.loads(raw)  # propagate JSONDecodeError as HTTP 502
+    if isinstance(parsed, dict) and isinstance(parsed.get("questions"), list):
+        return parsed["questions"], result
+    if isinstance(parsed, list):
+        return parsed, result
+    raise ValueError(f"Unexpected response shape: {type(parsed).__name__}")
+
+
+# ── Endpoint ───────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/generate-homework",
+    response_model=GenerateHomeworkResponse,
+    summary="Generate homework questions from the approved lesson plan and saved practice set",
+)
+async def generate_homework_questions(
+    body: GenerateHomeworkRequest,
+    user: Annotated[
+        AuthUser,
+        Depends(require_roles("teacher", "tutor", "co_teacher")),
+    ],
+) -> GenerateHomeworkResponse:
+    request_id = str(uuid.uuid4())[:8]
+    svc = get_service_client()
+
+    logger.info(
+        "[generate-homework][%s] user=%s lesson=%s count=%d practice_qs=%d",
+        request_id, user.id, body.lesson_id, body.question_count,
+        len(body.practice_questions),
+    )
+
+    # Verify lesson ownership (the Next.js proxy already does this, but double-check)
+    await _verify_lesson_access(lesson_id=body.lesson_id, user=user, svc=svc, owner_only=True)
+
+    if not body.practice_questions:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No practice questions provided — save practice questions first",
+        )
+
+    system_suffix, user_msg = _build_homework_context(
+        lesson_plan=body.lesson_plan,
+        practice_questions=body.practice_questions,
+        homework_options=body.homework_options,
+        teacher_prompt=body.teacher_prompt,
+        question_count=body.question_count,
+        exclude_questions=body.exclude_questions,
+    )
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": _GENERATE_HOMEWORK_SYSTEM + system_suffix},
+        {"role": "user", "content": user_msg},
+    ]
+
+    caller_id = user.id or "internal"
+    route = "POST /v1/online-lesson/generate-homework"
+    ai_usage: AIUsage | None = None
+
+    try:
+        questions_raw, result = await _call_with_structured_homework(
+            messages=messages,
+            model=settings.online_lesson_homework_model,
+        )
+        ai_usage = AIUsage(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+            model=result.usage.model,
+            request_id=result.usage.request_id,
+        )
+    except json.JSONDecodeError as exc:
+        logger.error("[generate-homework][%s] JSON parse failed: %s", request_id, exc)
+        await record_ai_usage(
+            svc, user_id=caller_id, source="online_lesson_generate_homework",
+            entity_type="lesson", entity_id=body.lesson_id,
+            route=route, status="error", error_message=f"JSON: {exc}",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="AI returned unexpected output — please try again",
+        ) from exc
+    except Exception as exc:
+        logger.error("[generate-homework][%s] OpenRouter error: %s", request_id, exc)
+        await record_ai_usage(
+            svc, user_id=caller_id, source="online_lesson_generate_homework",
+            entity_type="lesson", entity_id=body.lesson_id,
+            route=route, status="error", error_message=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="AI service unavailable — please try again",
+        ) from exc
+
+    await record_ai_usage(
+        svc, user_id=caller_id, source="online_lesson_generate_homework",
+        entity_type="lesson", entity_id=body.lesson_id,
+        route=route, usage=ai_usage, status="success",
+    )
+
+    # Repair each question
+    questions: list[HomeworkQuestion] = []
+    for i, qr in enumerate(questions_raw[: body.question_count]):
+        try:
+            q = _repair_homework_question(qr, slot=i + 1)
+            questions.append(q)
+        except Exception as exc:
+            logger.warning("[generate-homework][%s] question %d repair failed: %s", request_id, i, exc)
+            questions.append(HomeworkQuestion(
+                slot=i + 1,
+                question_type="short_answer",
+                difficulty="medium",
+                question_text=f"Question {i + 1}",
+                marks=2,
+            ))
+
+    if not questions:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="No homework questions were generated — please try again",
+        )
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    source_meta = {
+        "model": ai_usage.model,
+        "prompt_tokens": ai_usage.prompt_tokens,
+        "completion_tokens": ai_usage.completion_tokens,
+        "lesson_id": body.lesson_id,
+        "lesson_title": body.lesson_title,
+        "practice_material_id": body.practice_material_id,
+        "practice_question_count": len(body.practice_questions),
+        "generated_at": generated_at,
+        "prompt_version": "online_lesson_homework_v1",
+        "teacher_prompt": body.teacher_prompt,
+        "homework_options": body.homework_options.model_dump(),
+    }
+
+    logger.info(
+        "[generate-homework][%s] done questions=%d tokens=%s/%s",
+        request_id, len(questions), ai_usage.prompt_tokens, ai_usage.completion_tokens,
+    )
+
+    return GenerateHomeworkResponse(
+        questions=questions,
+        lesson_title=body.lesson_title,
+        source_meta=source_meta,
+    )

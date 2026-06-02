@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     online_lesson_plan_model: str = "google/gemini-2.5-flash"
     online_lesson_revise_model: str = "google/gemini-2.5-flash"
     online_lesson_questions_model: str = "google/gemini-2.5-flash"
+    online_lesson_homework_model: str = "google/gemini-2.5-flash"
 
     @property
     def origins_list(self) -> list[str]:
