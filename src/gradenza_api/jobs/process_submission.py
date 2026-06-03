@@ -275,6 +275,22 @@ def _fetch_quiz_question_row(source_id: str) -> dict | None:
     return result.data
 
 
+def _fetch_qb_generated_row(source_id: str) -> dict | None:
+    """Fetch a qb_generated row by UUID (used as source_id)."""
+    svc = get_service_client()
+    result = (
+        svc.table("qb_generated")
+        .select(
+            "id, question_type, question_text, options_json, correct_answer, "
+            "worked_solution, parts_json, markscheme_steps_json, total_marks"
+        )
+        .eq("id", source_id)
+        .maybe_single()
+        .execute()
+    )
+    return result.data
+
+
 # ── Quiz ParsedQuestion builder (3b) ─────────────────────────────────────────
 
 def _parsed_question_from_quiz_json(
@@ -322,6 +338,69 @@ def _parsed_question_from_quiz_json(
         markscheme_steps=[step],
         marks_available=marks,
         diagram_required=bool(qj.get("image_slot")),
+        ft_eligible_parts=[],
+        ft_dependencies={},
+        assignment_question_id=assignment_question_id,
+    )
+
+
+def _parsed_question_from_qb_generated_row(
+    row: dict,
+    assignment_question_id: str,
+    question_uuid: str,
+    source_id: str,
+    diagram_required: bool,
+) -> "ParsedQuestion":
+    """Convert a qb_generated row into a ParsedQuestion."""
+    parts = _parse_parts(row.get("parts_json"))
+    markscheme_steps = _parse_markscheme_steps(row.get("markscheme_steps_json"))
+    marks_available = _total_available_marks(markscheme_steps, parts)
+    if marks_available <= 0:
+        marks_available = int(row.get("total_marks") or 0)
+
+    q_type = row.get("question_type") or "short_answer"
+    q_text = str(row.get("question_text") or "")
+    options = row.get("options_json") or []
+    if q_type == "multiple_choice" and isinstance(options, list) and options:
+        opts_text = "\n".join(str(opt) for opt in options if str(opt).strip())
+        if opts_text:
+            q_text = f"{q_text}\n\n{opts_text}"
+
+    if not markscheme_steps:
+        # Fallback for all question types — occurs when teacher disabled "include markscheme"
+        # during homework generation. Always synthesise at least one step so the grader
+        # has a reference answer rather than grading blind.
+        correct = str(row.get("correct_answer") or "").strip()
+        solution = str(row.get("worked_solution") or "").strip()
+        if q_type == "multiple_choice":
+            description = f"Correct answer: {correct}." if correct else "Correct answer provided in source record."
+            if solution:
+                description += f" {solution}"
+        else:
+            parts_desc = []
+            if correct:
+                parts_desc.append(f"Model answer: {correct}.")
+            if solution:
+                parts_desc.append(f"Worked solution: {solution}")
+            description = " ".join(parts_desc) if parts_desc else "(No markscheme available — grade on merit)"
+        markscheme_steps = [
+            ParsedMarkschemeStep(
+                part_label=None,
+                description=description,
+                marks=marks_available or int(row.get("total_marks") or 1),
+                mark_type=None,
+            )
+        ]
+        marks_available = _total_available_marks(markscheme_steps, parts)
+
+    return ParsedQuestion(
+        question_uuid=question_uuid,
+        source_id=source_id,
+        problem_text=q_text,
+        parts=parts,
+        markscheme_steps=markscheme_steps,
+        marks_available=marks_available,
+        diagram_required=diagram_required,
         ft_eligible_parts=[],
         ft_dependencies={},
         assignment_question_id=assignment_question_id,
@@ -1002,6 +1081,23 @@ async def process_submission(
                 assignment_question_id=str(aq["id"]),
                 question_uuid=str(q_row.get("id")),
                 source_id=source_id,
+            )
+            questions.append(parsed)
+            continue
+
+        if source_table == "qb_generated":
+            raw_qb_row = await asyncio.to_thread(_fetch_qb_generated_row, source_id)
+            if not raw_qb_row:
+                logger.warning(
+                    "[job] qb_generated row not found for source_id=%s", source_id
+                )
+                continue
+            parsed = _parsed_question_from_qb_generated_row(
+                row=raw_qb_row,
+                assignment_question_id=str(aq["id"]),
+                question_uuid=str(q_row.get("id")),
+                source_id=source_id,
+                diagram_required=bool(q_row.get("diagram_required")),
             )
             questions.append(parsed)
             continue

@@ -226,6 +226,55 @@ def test_generated_rich_question_json_validates_and_repairs_marks() -> None:
     assert question.options == ["A. 1", "B. 2", "C. 3", "D. 4"]
 
 
+def test_homework_question_schema_requires_skills_and_standalone_explanation() -> None:
+    required = online_lessons._HOMEWORK_QUESTION_SCHEMA["properties"]["questions"]["items"]["required"]
+    properties = online_lessons._HOMEWORK_QUESTION_SCHEMA["properties"]["questions"]["items"]["properties"]
+
+    assert "skills" in required
+    assert "explanation" in required
+    assert properties["skills"]["type"] == "array"
+    assert properties["explanation"]["type"] == "string"
+
+
+def test_homework_question_repair_preserves_skills_and_explanation() -> None:
+    question = online_lessons._repair_homework_question(
+        {
+            "slot": 1,
+            "title": "Amplitude Homework",
+            "question_type": "short_answer",
+            "difficulty": "medium",
+            "marks": 2,
+            "estimated_time_minutes": 3,
+            "question_text": "Find the amplitude from max 7 and min 1.",
+            "options": [],
+            "correct_answer": "3",
+            "worked_solution": "Amplitude = (7 - 1) / 2 = 3.",
+            "explanation": "Amplitude is half the vertical distance between maximum and minimum.",
+            "markscheme_steps": [{"description": "Use half range", "marks": 2}],
+            "common_mistakes": [],
+            "hints": [],
+            "skills": ["find amplitude", "interpret graph features"],
+            "tags": ["trig"],
+            "domain": "Trigonometry",
+            "topic": "Graph transformations",
+            "subtopic": "Amplitude",
+            "exam_system": "IB",
+            "subject": "Mathematics",
+            "level": "HL",
+            "source_lesson_plan_excerpt": "Teach amplitude, period, and phase shift in trig graphs.",
+            "quality_notes": "Targets the core lesson objective.",
+            "similar_to_practice_slots": [1],
+            "variation_notes": "Uses different maximum and minimum values.",
+        },
+        slot=1,
+    )
+
+    assert question.explanation == "Amplitude is half the vertical distance between maximum and minimum."
+    assert question.skills == ["find amplitude", "interpret graph features"]
+    assert question.tags == ["trig"]
+    assert question.similar_to_practice_slots == [1]
+
+
 @pytest.mark.asyncio
 async def test_generate_questions_returns_rich_questions_and_lineage(monkeypatch: pytest.MonkeyPatch) -> None:
     raw = {

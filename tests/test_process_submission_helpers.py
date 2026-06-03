@@ -352,6 +352,30 @@ _IB_ROW = {
     "markscheme_steps_json": [{"description": "x=2", "marks": 5, "mark_type": "M"}],
 }
 
+_QB_GENERATED_AQ_ROW = {
+    "id": "aq-1",
+    "position": 1,
+    "question_id": "q-1",
+    "questions": {
+        "id": "q-1",
+        "source_id": "qb-1",
+        "source_table": "qb_generated",
+        "diagram_required": False,
+        "ft_eligible_parts": [],
+        "ft_dependencies": {},
+    },
+}
+
+_QB_GENERATED_ROW = {
+    "id": "qb-1",
+    "question_text": "Find the amplitude from maximum 5 and minimum -1.",
+    "parts_json": [],
+    "markscheme_steps_json": [
+        {"description": "Use half the range: (5 - -1) / 2 = 3", "marks": 3}
+    ],
+    "total_marks": 3,
+}
+
 _LLM_RESPONSE = json.dumps({
     "total_marks_awarded": 3,
     "total_method_marks": 2,
@@ -366,13 +390,20 @@ _LLM_RESPONSE = json.dumps({
 })
 
 
-def _make_grading_svc(upsert_raises: bool = False):
+def _make_grading_svc(
+    upsert_raises: bool = False,
+    *,
+    aq_row: dict | None = None,
+    ib_row: dict | None = None,
+    qb_generated_row: dict | None = None,
+):
     """Build a multi-table mock svc wired for the full grading happy path."""
     photos_tbl = MagicMock()
     subs_tbl = MagicMock()
     prompt_tbl = MagicMock()
     aq_tbl = MagicMock()
     ib_tbl = MagicMock()
+    qb_tbl = MagicMock()
     gr_tbl = MagicMock()
 
     def photos_select(fields):
@@ -399,10 +430,13 @@ def _make_grading_svc(upsert_raises: bool = False):
     prompt_tbl.select.return_value.eq.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = _PROMPT_ROW
 
     # assignment_questions
-    aq_tbl.select.return_value.eq.return_value.order.return_value.execute.return_value.data = [_AQ_ROW]
+    aq_tbl.select.return_value.eq.return_value.order.return_value.execute.return_value.data = [aq_row or _AQ_ROW]
 
     # ib_math_questionbank
-    ib_tbl.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = _IB_ROW
+    ib_tbl.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = ib_row or _IB_ROW
+
+    # qb_generated
+    qb_tbl.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = qb_generated_row
 
     # grading_results upsert — succeed or raise based on flag
     if upsert_raises:
@@ -414,6 +448,7 @@ def _make_grading_svc(upsert_raises: bool = False):
         "grading_prompt_versions": prompt_tbl,
         "assignment_questions": aq_tbl,
         "ib_math_questionbank": ib_tbl,
+        "qb_generated": qb_tbl,
         "grading_results": gr_tbl,
     }
     svc = MagicMock()
@@ -445,6 +480,66 @@ async def test_grading_results_upsert_called_with_keyword_on_conflict():
     payload = pos_args[0]
     assert payload["submission_id"] == "sub-grade"
     assert payload["assignment_question_id"] == "aq-1"
+
+
+async def test_process_submission_resolves_qb_generated_questions():
+    """Published online-lesson homework uses qb_generated sources and must auto-grade."""
+    svc, _, gr_tbl = _make_grading_svc(
+        aq_row=_QB_GENERATED_AQ_ROW,
+        qb_generated_row=_QB_GENERATED_ROW,
+    )
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "gradenza_api.jobs.process_submission.call_openrouter",
+            new_callable=AsyncMock,
+            return_value=_LLM_RESPONSE,
+        ) as mock_llm,
+    ):
+        result = await process_submission({}, submission_id="sub-grade", force=False)
+
+    assert result["questions_graded"] == 1
+    assert result["errors"] == 0
+    assert mock_llm.await_count == 1
+    payload = gr_tbl.upsert.call_args.args[0]
+    assert payload["assignment_question_id"] == "aq-1"
+    assert payload["marks_available"] == 3
+
+
+async def test_process_submission_includes_qb_generated_mcq_options_in_prompt():
+    """Published MCQ homework must include choices when sent to the grader."""
+    mcq_row = {
+        **_QB_GENERATED_ROW,
+        "question_type": "multiple_choice",
+        "question_text": "What is the amplitude from maximum 5 and minimum -1?",
+        "options_json": ["A. 2", "B. 3", "C. 6"],
+        "correct_answer": "B",
+        "worked_solution": "Amplitude is half the range.",
+    }
+    svc, _, _ = _make_grading_svc(
+        aq_row=_QB_GENERATED_AQ_ROW,
+        qb_generated_row=mcq_row,
+    )
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "gradenza_api.jobs.process_submission.call_openrouter",
+            new_callable=AsyncMock,
+            return_value=_LLM_RESPONSE,
+        ) as mock_llm,
+    ):
+        result = await process_submission({}, submission_id="sub-grade", force=False)
+
+    assert result["questions_graded"] == 1
+    user_message = mock_llm.await_args.kwargs["messages"][1]["content"]
+    assert "What is the amplitude from maximum 5 and minimum -1?" in user_message
+    assert "A. 2" in user_message
+    assert "B. 3" in user_message
+    assert "C. 6" in user_message
 
 
 async def test_grading_results_upsert_success_clears_error_and_advances_to_graded():

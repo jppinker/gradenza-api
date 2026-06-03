@@ -1846,9 +1846,9 @@ _HOMEWORK_QUESTION_SCHEMA: dict[str, Any] = {
                 "required": [
                     "slot", "title", "question_type", "difficulty", "marks",
                     "estimated_time_minutes", "question_text", "options",
-                    "correct_answer", "worked_solution", "markscheme_steps",
-                    "common_mistakes", "hints", "tags", "domain", "topic",
-                    "subtopic", "exam_system", "subject", "level",
+                    "correct_answer", "worked_solution", "explanation",
+                    "markscheme_steps", "common_mistakes", "hints", "skills",
+                    "tags", "domain", "topic", "subtopic", "exam_system", "subject", "level",
                     "source_lesson_plan_excerpt", "quality_notes",
                     "similar_to_practice_slots", "variation_notes",
                 ],
@@ -1863,6 +1863,7 @@ _HOMEWORK_QUESTION_SCHEMA: dict[str, Any] = {
                     "options":                    {"type": "array", "items": {"type": "string"}},
                     "correct_answer":             {"type": "string"},
                     "worked_solution":            {"type": "string"},
+                    "explanation":                {"type": "string"},
                     "markscheme_steps": {
                         "type": "array",
                         "items": {
@@ -1877,6 +1878,7 @@ _HOMEWORK_QUESTION_SCHEMA: dict[str, Any] = {
                     },
                     "common_mistakes":            {"type": "array", "items": {"type": "string"}},
                     "hints":                      {"type": "array", "items": {"type": "string"}},
+                    "skills":                     {"type": "array", "items": {"type": "string"}},
                     "tags":                       {"type": "array", "items": {"type": "string"}},
                     "domain":                     {"type": "string"},
                     "topic":                      {"type": "string"},
@@ -1909,9 +1911,11 @@ class HomeworkQuestion(BaseModel):
     options: list[str] = Field(default_factory=list)
     correct_answer: str = ""
     worked_solution: str = ""
+    explanation: str = ""
     markscheme_steps: list[MarkschemeStep] = Field(default_factory=list)
     common_mistakes: list[str] = Field(default_factory=list)
     hints: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     domain: str = ""
     topic: str = ""
@@ -1998,9 +2002,11 @@ Each question object must contain ALL of these fields with the correct types:
   "options": ["A. ...", "B. ...", "C. ...", "D. ..."] for multiple_choice, [] for all other types,
   "correct_answer": "<for MCQ: the letter only, e.g. 'B'; for other types: full model answer>",
   "worked_solution": "<complete step-by-step worked solution>",
+  "explanation": "<standalone concise explanation of the concept or reasoning, separate from the worked steps>",
   "markscheme_steps": [{"description": "<what earns this mark>", "marks": <integer>}, ...],
   "common_mistakes": ["<mistake 1>", "<mistake 2>"],
   "hints": ["<hint 1>"],
+  "skills": ["<specific skill 1>", "<specific skill 2>"],
   "tags": ["<tag 1>", "<tag 2>", "<tag 3>"],
   "domain": "<curriculum domain or unit>",
   "topic": "<specific topic>",
@@ -2022,6 +2028,8 @@ Quality rules — follow these strictly:
 - Math notation: use LaTeX; in JSON strings escape backslashes: \\\\( inline \\\\) and \\\\[ display \\\\].
 - MCQ: exactly 4 options (A–D). Each distractor must be a plausible misconception — not random wrong answers.
 - worked_solution: show every step.
+- explanation: explain the core idea in 1–3 sentences; do not duplicate the worked_solution verbatim.
+- skills: list the assessable skills required, not generic tags.
 - options: always use [] for non-MCQ questions.
 
 Return ONLY the JSON object. No markdown fences, no preamble, no postamble.
@@ -2120,6 +2128,11 @@ def _repair_homework_question(qr: Any, slot: int) -> HomeworkQuestion:
             return result
         return []
 
+    def _str_list(val: Any) -> list[str]:
+        if isinstance(val, list):
+            return [str(s).strip() for s in val if str(s).strip()]
+        return []
+
     return HomeworkQuestion(
         slot=base.slot,
         title=base.title,
@@ -2131,10 +2144,12 @@ def _repair_homework_question(qr: Any, slot: int) -> HomeworkQuestion:
         options=base.options,
         correct_answer=base.correct_answer,
         worked_solution=base.worked_solution,
+        explanation=str(qr.get("explanation") or base.worked_solution).strip(),
         markscheme_steps=base.markscheme_steps,
         common_mistakes=base.common_mistakes,
         hints=base.hints,
-        tags=base.tags,
+        skills=_str_list(qr.get("skills")) or base.tags,
+        tags=base.tags or _str_list(qr.get("skills")),
         domain=base.domain,
         topic=base.topic,
         subtopic=base.subtopic,
@@ -2221,7 +2236,7 @@ async def generate_homework_questions(
     body: GenerateHomeworkRequest,
     user: Annotated[
         AuthUser,
-        Depends(require_roles("teacher", "tutor", "co_teacher")),
+        Depends(require_roles("teacher", "tutor")),
     ],
 ) -> GenerateHomeworkResponse:
     request_id = str(uuid.uuid4())[:8]
