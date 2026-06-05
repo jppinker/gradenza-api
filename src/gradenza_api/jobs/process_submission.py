@@ -942,8 +942,62 @@ async def process_submission(
     if isinstance(exam_systems, list):
         exam_systems = exam_systems[0] if exam_systems else {}
 
-    exam_system_code: str = exam_systems.get("code") or "IB"
+    exam_system_code: str = exam_systems.get("code") or ""
+    # Fallback chain: class.exam_system_id → source_table lookup (see below)
     exam_system_id: str = classes.get("exam_system_id") or ""
+
+    # If still unresolved, derive from the first question's source_table
+    if not exam_system_id:
+        _SOURCE_TABLE_TO_SYSTEM_CODE: dict[str, str] = {
+            "waec_math_questionbank": "WAEC",
+        }
+
+        def _fetch_source_table_hint() -> str | None:
+            res = (
+                svc.table("assignment_questions")
+                .select("questions(source_table)")
+                .eq("assignment_id", submission_row.get("assignment_id", ""))
+                .limit(1)
+                .maybe_single()
+                .execute()
+            )
+            if not res.data:
+                return None
+            q = res.data.get("questions") or {}
+            if isinstance(q, list):
+                q = q[0] if q else {}
+            return q.get("source_table")  # type: ignore[return-value]
+
+        source_table_hint = await asyncio.to_thread(_fetch_source_table_hint)
+        derived_code = _SOURCE_TABLE_TO_SYSTEM_CODE.get(source_table_hint or "", "IB")
+        if not exam_system_code:
+            exam_system_code = derived_code
+
+        def _fetch_exam_system_by_code() -> dict | None:
+            res = (
+                svc.table("exam_systems")
+                .select("id, code")
+                .eq("code", exam_system_code)
+                .eq("is_active", True)
+                .maybe_single()
+                .execute()
+            )
+            return res.data  # type: ignore[return-value]
+
+        es_row = await asyncio.to_thread(_fetch_exam_system_by_code)
+        if es_row:
+            exam_system_id = es_row["id"]
+            exam_system_code = es_row["code"]
+        else:
+            logger.error(
+                "[job] submission=%s: cannot resolve exam_system for assignment=%s (code=%s)",
+                submission_id, submission_row.get("assignment_id"), exam_system_code,
+            )
+            await asyncio.to_thread(_set_processing_error, "no_exam_system")
+            return {"submission_id": submission_id, "error": "no_exam_system"}
+
+    if not exam_system_code:
+        exam_system_code = "IB"
 
     # 4b. Fetch active grading prompt
     def _fetch_prompt() -> dict | None:
@@ -1103,20 +1157,21 @@ async def process_submission(
             continue
 
         def _fetch_ib_row(sid: str) -> dict | None:
-            if source_table == "ib_math_questionbank":
-                res = (
-                    svc.table("ib_math_questionbank")
-                    .select(
-                        "id, domain, theme, theme_slug, level, difficulty, problem_text, "
-                        "question_media_count, parts_count, parts_json, "
-                        "markscheme_steps_count, markscheme_steps_json"
-                    )
-                    .eq("id", int(sid))
-                    .maybe_single()
-                    .execute()
+            _IB_TABLES = ("ib_math_questionbank", "ib_new_math")
+            if source_table not in _IB_TABLES:
+                return None
+            res = (
+                svc.table(source_table)
+                .select(
+                    "id, domain, theme, theme_slug, level, difficulty, problem_text, "
+                    "question_media_count, parts_count, parts_json, "
+                    "markscheme_steps_count, markscheme_steps_json"
                 )
-                return res.data
-            return None
+                .eq("id", int(sid))
+                .maybe_single()
+                .execute()
+            )
+            return res.data
 
         raw_row = await asyncio.to_thread(_fetch_ib_row, source_id)
         if not raw_row:
