@@ -48,6 +48,19 @@ def test_claude_sonnet_higher_cost():
     assert cost.cost_credits == 11
 
 
+def test_openai_gpt55_known_values():
+    """
+    openai/gpt-5.5: prompt=5, completion=30 per million.
+
+    raw_cost = 20000*5/1e6 + 3000*30/1e6 = 0.1 + 0.09 = 0.19
+    cost_credits = ceil(0.19 * 100) = 19
+    """
+    cost = calculate_openrouter_cost("openai/gpt-5.5", 20_000, 3_000)
+    assert cost is not None
+    assert cost.cost_usd == pytest.approx(0.19, abs=1e-7)
+    assert cost.cost_credits == 19
+
+
 def test_zero_tokens_returns_zero_cost():
     cost = calculate_openrouter_cost("google/gemini-2.5-flash", 0, 0)
     assert cost is not None

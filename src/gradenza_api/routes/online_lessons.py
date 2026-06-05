@@ -18,11 +18,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
 
 from gradenza_api.auth import AuthUser, require_roles
-from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
+from gradenza_api.services.attachment_context import build_attachment_context
+from gradenza_api.services.openrouter import (
+    call_openrouter,
+    is_model_unavailable_error,
+    strip_json_fences,
+)
 from gradenza_api.services.supabase_client import get_service_client, run_sync
 from gradenza_api.services.usage import AIUsage, record_ai_usage
 
@@ -135,6 +140,11 @@ Important:
 - Do NOT generate a full lesson plan in chat — that happens after the teacher clicks "Generate".
 - Do NOT explain the JSON fields in your reply — just include the reply text naturally.
 - Do NOT wrap JSON in markdown code fences.
+
+When attached materials are provided in the context:
+- If an attachment clearly identifies a specific, teachable topic or concept, count this toward readyToGenerateLessonPlan — even if the teacher has not typed the topic yet.
+- Acknowledge what you found in one brief sentence, e.g. "I can see this worksheet covers quadratic equations by completing the square."
+- Do NOT reproduce large passages verbatim — summarise what is educationally relevant.
 """
 
 
@@ -152,11 +162,25 @@ class LessonChatContext(BaseModel):
     notesCount: int = 0
 
 
+class AttachmentContext(BaseModel):
+    """Attachment content forwarded from Next.js for AI context injection."""
+    id: str = ""
+    file_name: str = ""
+    file_type: str = ""
+    status: str = "ready"
+    extracted_at: str = ""
+    content_hash: str = ""
+    summary: str = ""
+    extracted_text: str = ""
+    analysis_json: dict[str, Any] = Field(default_factory=dict)
+
+
 class OnlineLessonChatRequest(BaseModel):
     lesson_id: str
     message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_LENGTH)
     history: list[ChatHistoryTurn] = Field(default_factory=list)
     context: LessonChatContext | None = None
+    attachments: list[AttachmentContext] = Field(default_factory=list)
 
 
 class OnlineLessonChatResponse(BaseModel):
@@ -166,6 +190,7 @@ class OnlineLessonChatResponse(BaseModel):
     detectedTopic: str = ""
     detectedObjectives: list[str] = Field(default_factory=list)
     suggestedQuestionCount: int = 0
+    model: str | None = None  # actual model returned by provider (for metadata/audit)
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
@@ -357,6 +382,20 @@ def _build_context_block(lesson: dict[str, Any], ctx: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _attachments_to_dicts(attachments: list[AttachmentContext]) -> list[dict]:
+    """Convert Pydantic AttachmentContext models to plain dicts for the shared service."""
+    return [a.model_dump() for a in attachments]
+
+
+def _online_lesson_ai_error_detail(exc: Exception, *, model: str, env_var: str) -> str:
+    if is_model_unavailable_error(exc):
+        return (
+            f"Configured AI model '{model}' is unavailable or invalid on OpenRouter. "
+            f"Check {env_var} and try again."
+        )
+    return "AI service unavailable — please try again"
+
+
 def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -473,7 +512,9 @@ async def _call_with_structured_output(messages: list[dict[str, Any]]) -> dict[s
             },
         )
         return json.loads(strip_json_fences(result.content)), result
-    except (json.JSONDecodeError, Exception) as exc:
+    except Exception as exc:
+        if is_model_unavailable_error(exc):
+            raise
         logger.warning("[online-lesson-chat] strict schema failed: %s", exc)
 
     # Attempt 2: json_object mode
@@ -485,7 +526,9 @@ async def _call_with_structured_output(messages: list[dict[str, Any]]) -> dict[s
             response_format={"type": "json_object"},
         )
         return json.loads(strip_json_fences(result.content)), result
-    except (json.JSONDecodeError, Exception) as exc:
+    except Exception as exc:
+        if is_model_unavailable_error(exc):
+            raise
         logger.warning("[online-lesson-chat] json_object mode failed: %s", exc)
 
     # Attempt 3: plain call
@@ -531,6 +574,14 @@ async def online_lesson_chat(
     if context_block.strip():
         system += f"\n\n## Current lesson context\n{context_block}"
 
+    if body.attachments:
+        att_block, _, _ = build_attachment_context(
+            _attachments_to_dicts(body.attachments),
+            header="## Teacher-attached materials (use as lesson context)",
+        )
+        if att_block:
+            system += f"\n\n{att_block}"
+
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     for turn in body.history[-MAX_HISTORY_TURNS:]:
         messages.append({"role": turn.role, "content": turn.content})
@@ -569,7 +620,11 @@ async def online_lesson_chat(
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="AI service unavailable — please try again",
+            detail=_online_lesson_ai_error_detail(
+                exc,
+                model=settings.online_lesson_chat_model,
+                env_var="ONLINE_LESSON_CHAT_MODEL",
+            ),
         ) from exc
 
     await record_ai_usage(
@@ -607,6 +662,7 @@ async def online_lesson_chat(
         detectedTopic=topic,
         detectedObjectives=objectives,
         suggestedQuestionCount=q_count,
+        model=ai_usage.model if ai_usage else None,
     )
 
 
@@ -644,12 +700,23 @@ Rules:
 - Do not add extra sections beyond the 10 listed above.
 - Do not include a preamble or postamble — start directly with ## Lesson Overview.
 - Return only the Markdown. No code fences around it.
+
+When teacher-provided materials (attached files) appear in the context:
+- Treat them as authoritative source material provided directly by the teacher.
+- Incorporate relevant definitions, examples, worked problems, notation, and sequencing from those materials.
+- Use slide or page structure to inform section ordering and Suggested Pacing where applicable.
+- If a worked example from an attachment is educationally valuable, include a similar (not verbatim) example in the Worked Examples section and credit the attachment style (e.g., "As shown in the teacher's slides").
+- Do NOT copy long passages verbatim — extract the educational intent and restate it in clear teaching language.
+- If attachment content conflicts with an explicit teacher instruction from the chat, follow the teacher's explicit instruction. Note the discrepancy briefly in the Lesson Overview (e.g., "Note: the uploaded slides cover X but the teacher has asked to focus on Y instead.").
+- Only incorporate attachment content that is relevant to the identified lesson topic; ignore unrelated material.
+- If no attachments are provided, generate the plan from the chat context and lesson information alone.
 """
 
 
 class GeneratePlanRequest(BaseModel):
     lesson_id: str
     chat_history: list[ChatHistoryTurn] = Field(default_factory=list)
+    attachments: list[AttachmentContext] = Field(default_factory=list)
 
 
 class GeneratePlanResponse(BaseModel):
@@ -684,6 +751,14 @@ async def generate_lesson_plan(
     system = _GENERATE_PLAN_SYSTEM
     if context_block.strip():
         system += f"\n\n## Lesson context\n{context_block}"
+
+    if body.attachments:
+        att_block, _, _ = build_attachment_context(
+            _attachments_to_dicts(body.attachments),
+            header="## Teacher-provided materials (incorporate relevant content into the plan)",
+        )
+        if att_block:
+            system += f"\n\n{att_block}"
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     history = body.chat_history[-MAX_PLAN_HISTORY_TURNS:]
@@ -728,7 +803,11 @@ async def generate_lesson_plan(
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="AI service unavailable — please try again",
+            detail=_online_lesson_ai_error_detail(
+                exc,
+                model=settings.online_lesson_plan_model,
+                env_var="ONLINE_LESSON_PLAN_MODEL",
+            ),
         ) from exc
 
     await record_ai_usage(
@@ -759,6 +838,17 @@ async def generate_lesson_plan(
         "completion_tokens": result.usage.completion_tokens,
         "studentCount": len(db_ctx.get("students") or []),
         "className": db_ctx.get("className"),
+        "attachments": [
+            {
+                "id": a.id,
+                "fileName": a.file_name,
+                "fileType": a.file_type,
+                "status": a.status,
+                "extractedAt": a.extracted_at,
+                "contentHash": a.content_hash,
+            }
+            for a in body.attachments
+        ],
     }
 
     logger.info(
@@ -860,7 +950,11 @@ async def revise_lesson_plan(
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="AI service unavailable — please try again",
+            detail=_online_lesson_ai_error_detail(
+                exc,
+                model=settings.online_lesson_revise_model,
+                env_var="ONLINE_LESSON_REVISE_MODEL",
+            ),
         ) from exc
 
     await record_ai_usage(
@@ -1282,6 +1376,15 @@ async def suggest_question_options(
 _GENERATE_QUESTIONS_SYSTEM = """\
 You are an expert assessment designer. Generate high-quality, teacher-ready practice questions from an approved lesson plan.
 
+When teacher-provided materials (attached files) appear in the context:
+- Use them to infer question style, command word conventions, notation, difficulty expectations, and target skills.
+- Use prerequisite vocabulary and concept framing from the materials so questions feel cohesive with what the teacher uploaded.
+- Generate ORIGINAL questions inspired by the material — do NOT reproduce questions from the attachments verbatim.
+  Exception: if the teacher's instructions explicitly say "use the questions from this file" or "adapt the questions in this worksheet", you may closely adapt existing questions. In that case, record the adaptation in quality_notes (e.g., "Adapted from uploaded worksheet — changed values and context.").
+- Match the command word style implied by the materials (e.g., "Find the value of", "Show that", "Hence or otherwise") when appropriate for the exam system.
+- Prefer problems that test the same concept using different numbers, contexts, or representations than those seen in the attachment.
+- Do not reproduce copyrighted worksheet content verbatim; paraphrase and adapt instead.
+
 Your output MUST be a single JSON object: {"questions": [<question objects>]}
 
 Each question object must contain ALL of these fields with the correct types:
@@ -1429,6 +1532,7 @@ class GenerateQuestionsRequest(BaseModel):
     question_count: int = Field(default=5, ge=1, le=20)
     exclude_questions: list[str] | None = None
     generation_options: GenerationOptions | None = None
+    attachments: list[AttachmentContext] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -1622,6 +1726,8 @@ async def _call_with_structured_questions(
         if isinstance(parsed, list):
             return parsed, result
     except Exception as exc:
+        if is_model_unavailable_error(exc):
+            raise
         logger.warning("[generate-questions] strict schema attempt failed: %s", exc)
 
     # Attempt 2: json_object mode
@@ -1638,6 +1744,8 @@ async def _call_with_structured_questions(
         if isinstance(parsed, list):
             return parsed, result
     except Exception as exc:
+        if is_model_unavailable_error(exc):
+            raise
         logger.warning("[generate-questions] json_object attempt failed: %s", exc)
 
     # Attempt 3: plain call + parse
@@ -1702,6 +1810,14 @@ async def generate_practice_questions(
         + f"\n\n## Approved lesson plan\n{lesson_plan[:6000]}"
     )
 
+    if body.attachments:
+        att_block, _, _ = build_attachment_context(
+            _attachments_to_dicts(body.attachments),
+            header="## Teacher-provided materials (use for context and inspiration — generate original questions)",
+        )
+        if att_block:
+            system += f"\n\n{att_block}"
+
     if body.generation_options:
         opts_block = _build_options_block(body.generation_options, body.question_count)
         if opts_block:
@@ -1756,7 +1872,11 @@ async def generate_practice_questions(
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="AI service unavailable — please try again",
+            detail=_online_lesson_ai_error_detail(
+                exc,
+                model=settings.online_lesson_questions_model,
+                env_var="ONLINE_LESSON_QUESTIONS_MODEL",
+            ),
         ) from exc
 
     await record_ai_usage(
@@ -1811,6 +1931,17 @@ async def generate_practice_questions(
         "generation_options": body.generation_options.model_dump() if body.generation_options else {
             "question_count": body.question_count,
         },
+        "attachments": [
+            {
+                "id": a.id,
+                "fileName": a.file_name,
+                "fileType": a.file_type,
+                "status": a.status,
+                "extractedAt": a.extracted_at,
+                "contentHash": a.content_hash,
+            }
+            for a in body.attachments
+        ],
     }
 
     logger.info(
@@ -1961,6 +2092,7 @@ class GenerateHomeworkRequest(BaseModel):
     question_count: int = Field(default=5, ge=1, le=20)
     homework_options: HomeworkOptions = Field(default_factory=HomeworkOptions)
     exclude_questions: list[str] = Field(default_factory=list)
+    attachments: list[AttachmentContext] = Field(default_factory=list)
 
 
 class GenerateHomeworkResponse(BaseModel):
@@ -1978,6 +2110,15 @@ You have been given:
 1. The approved lesson plan for this lesson.
 2. The practice questions used during the lesson (which the students have already seen).
 3. A teacher prompt (which may customise the homework).
+4. Optionally: teacher-uploaded materials (attached files) providing additional context.
+
+When teacher-provided materials appear in the context:
+- Use them to understand the style, difficulty level, prerequisite knowledge, and skills expected of these students.
+- Use vocabulary and notation conventions from the materials so homework feels consistent with what the teacher provided.
+- Generate ORIGINAL questions — do NOT copy questions from the attachments.
+  Exception: if the teacher explicitly says "transform the questions in this file" or "adapt this worksheet", you may closely adapt existing questions. Record this in variation_notes.
+- Infer preferred question style from the materials (e.g., structured multi-part questions, command words, mark allocations) and match that style.
+- Do not reproduce copyrighted worksheet content verbatim; paraphrase and use different values or contexts.
 
 Your task: generate NEW homework questions that reinforce the same learning objectives as the practice
 questions, but are NOT copies. Each homework question must differ in at least one of:
@@ -2043,6 +2184,7 @@ def _build_homework_context(
     teacher_prompt: str,
     question_count: int,
     exclude_questions: list[str],
+    attachments: list[AttachmentContext] | None = None,
 ) -> tuple[str, str]:
     """
     Build system suffix and user message for homework generation.
@@ -2086,6 +2228,14 @@ def _build_homework_context(
         f"- Worked solutions: {'Include full step-by-step worked solutions.' if homework_options.include_worked_solutions else 'Brief answer only (no worked solution).'}\n"
         f"- Markscheme: {'Include detailed markscheme steps.' if homework_options.include_markscheme else 'Omit markscheme steps (empty array).'}"
     )
+
+    if attachments:
+        att_block, _, _ = build_attachment_context(
+            _attachments_to_dicts(attachments),
+            header="## Teacher-provided materials (use for context — do not reproduce questions verbatim)",
+        )
+        if att_block:
+            system_suffix += f"\n\n{att_block}"
 
     teacher_instruction = teacher_prompt.strip()
     if not teacher_instruction:
@@ -2264,6 +2414,7 @@ async def generate_homework_questions(
         teacher_prompt=body.teacher_prompt,
         question_count=body.question_count,
         exclude_questions=body.exclude_questions,
+        attachments=body.attachments or None,
     )
 
     messages: list[dict[str, Any]] = [
@@ -2351,6 +2502,17 @@ async def generate_homework_questions(
         "prompt_version": "online_lesson_homework_v1",
         "teacher_prompt": body.teacher_prompt,
         "homework_options": body.homework_options.model_dump(),
+        "attachments": [
+            {
+                "id": a.id,
+                "fileName": a.file_name,
+                "fileType": a.file_type,
+                "status": a.status,
+                "extractedAt": a.extracted_at,
+                "contentHash": a.content_hash,
+            }
+            for a in body.attachments
+        ],
     }
 
     logger.info(
@@ -2362,4 +2524,189 @@ async def generate_homework_questions(
         questions=questions,
         lesson_title=body.lesson_title,
         source_meta=source_meta,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Attachment analysis (PROMPT7)
+# POST /v1/online-lesson/attachments/analyze
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AnalyzeAttachmentRequest(BaseModel):
+    attachment_id: str = Field(..., min_length=1)
+    lesson_id: str = Field(..., min_length=1)
+
+
+class AnalyzeAttachmentResponse(BaseModel):
+    attachment_id: str
+    status: str
+    job_id: str | None = None
+
+
+@router.post(
+    "/attachments/analyze",
+    response_model=AnalyzeAttachmentResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Trigger extraction and AI analysis of a lesson attachment",
+)
+async def analyze_lesson_attachment(
+    body: AnalyzeAttachmentRequest,
+    request: Request,
+    user: Annotated[
+        AuthUser,
+        Depends(require_roles("teacher", "tutor", "co_teacher")),
+    ],
+) -> AnalyzeAttachmentResponse:
+    """
+    Sets attachment status to 'processing' and enqueues the ARQ job
+    analyze_attachment.  Returns 202 immediately so the upload route
+    does not have to wait for extraction to complete.
+
+    Falls back to an asyncio background task when Redis is unavailable
+    (e.g. local dev without Redis).
+    """
+    request_id = str(uuid.uuid4())[:8]
+    svc = get_service_client()
+
+    # Validate UUIDs
+    for label, value in [("lesson_id", body.lesson_id), ("attachment_id", body.attachment_id)]:
+        try:
+            uuid.UUID(value)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid {label}",
+            ) from exc
+
+    # Verify the lesson is accessible to this user
+    await _verify_lesson_access(
+        lesson_id=body.lesson_id, user=user, svc=svc, owner_only=True
+    )
+
+    # Verify the attachment belongs to this lesson and teacher
+    def _fetch_attachment() -> dict | None:
+        return (
+            svc.table("online_lesson_attachments")
+            .select("id, lesson_id, teacher_id, status")
+            .eq("id", body.attachment_id)
+            .eq("lesson_id", body.lesson_id)
+            .maybe_single()
+            .execute()
+            .data
+        )
+
+    attachment = await run_sync(_fetch_attachment)
+    if not attachment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attachment not found",
+        )
+    if not user.is_internal and attachment.get("teacher_id") != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    current_status = attachment.get("status", "uploaded")
+    if current_status in ("processing", "ready"):
+        # Idempotent: already in progress or done
+        return AnalyzeAttachmentResponse(
+            attachment_id=body.attachment_id,
+            status=current_status,
+        )
+
+    # Mark as processing
+    def _set_processing() -> None:
+        svc.table("online_lesson_attachments").update(
+            {"status": "processing", "error_message": None}
+        ).eq("id", body.attachment_id).execute()
+
+    await run_sync(_set_processing)
+
+    logger.info(
+        "[attachments/analyze][%s] queuing attachment=%s lesson=%s",
+        request_id, body.attachment_id, body.lesson_id,
+    )
+
+    # When called with INTERNAL_API_SECRET the auth user has no id; fall back
+    # to the attachment owner so AI usage is attributed to the right teacher.
+    effective_user_id = user.id or attachment.get("teacher_id") or ""
+
+    # Enqueue ARQ job (preferred) or fall back to asyncio background task
+    job_id = str(uuid.uuid4())
+    redis = getattr(request.app.state, "redis", None)
+
+    if redis is not None:
+        try:
+            await redis.enqueue_job(
+                "analyze_attachment",
+                attachment_id=body.attachment_id,
+                lesson_id=body.lesson_id,
+                user_id=effective_user_id,
+                _job_id=job_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[attachments/analyze][%s] Redis enqueue failed (%s) — falling back to in-process task",
+                request_id, exc,
+            )
+            redis = None  # trigger fallback
+
+    if redis is None:
+        # Fallback: run in-process (no persistence if process restarts)
+        from gradenza_api.jobs.analyze_attachment import analyze_attachment as _analyze_fn
+
+        async def _bg() -> None:
+            try:
+                await _analyze_fn(
+                    {},
+                    attachment_id=body.attachment_id,
+                    lesson_id=body.lesson_id,
+                    user_id=effective_user_id,
+                )
+            except Exception as exc:
+                logger.error("[attachments/analyze][%s] in-process task failed: %s", request_id, exc)
+
+        asyncio.create_task(_bg())
+        job_id = None
+
+    return AnalyzeAttachmentResponse(
+        attachment_id=body.attachment_id,
+        status="processing",
+        job_id=job_id,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Admin diagnostics — configured model names
+# GET /v1/online-lesson/config
+# ══════════════════════════════════════════════════════════════════════════════
+
+class OnlineLessonConfigResponse(BaseModel):
+    chat_model: str
+    questions_model: str
+    plan_model: str
+    revise_model: str
+    homework_model: str
+
+
+@router.get(
+    "/config",
+    response_model=OnlineLessonConfigResponse,
+    summary="Return configured Online Lesson AI model names (admin/internal only)",
+)
+async def online_lesson_config(
+    user: Annotated[
+        AuthUser,
+        Depends(require_roles("school_admin")),
+    ],
+) -> OnlineLessonConfigResponse:
+    """
+    Returns the model identifiers currently configured for each Online Lesson
+    AI feature.  Accessible to school_admin users and internal service calls.
+    No secrets or API keys are exposed — only model name strings.
+    """
+    return OnlineLessonConfigResponse(
+        chat_model=settings.online_lesson_chat_model,
+        questions_model=settings.online_lesson_questions_model,
+        plan_model=settings.online_lesson_plan_model,
+        revise_model=settings.online_lesson_revise_model,
+        homework_model=settings.online_lesson_homework_model,
     )

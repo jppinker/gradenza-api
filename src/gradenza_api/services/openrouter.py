@@ -30,19 +30,37 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _DEFAULT_TIMEOUT = 120.0  # seconds — vision + reasoning models can be slow
 
 
-def _is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.RequestError):
-        return True
-    if isinstance(exc, _OpenRouterHTTPError):
-        return exc.status_code in (429, 500, 502, 503, 504)
-    return False
-
-
-class _OpenRouterHTTPError(Exception):
+class OpenRouterHTTPError(Exception):
     def __init__(self, status_code: int, body: str) -> None:
         super().__init__(f"OpenRouter {status_code}: {body[:200]}")
         self.status_code = status_code
         self.body = body
+
+
+_OpenRouterHTTPError = OpenRouterHTTPError
+
+
+def is_model_unavailable_error(exc: BaseException) -> bool:
+    if not isinstance(exc, OpenRouterHTTPError):
+        return False
+    body = exc.body.lower()
+    if exc.status_code not in (400, 404, 422):
+        return False
+    return (
+        "no endpoints found" in body
+        or "unknown model" in body
+        or "model does not exist" in body
+        or "model not found" in body
+        or ("model" in body and ("unavailable" in body or "invalid" in body))
+    )
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.RequestError):
+        return True
+    if isinstance(exc, OpenRouterHTTPError):
+        return exc.status_code in (429, 500, 502, 503, 504)
+    return False
 
 
 @dataclass

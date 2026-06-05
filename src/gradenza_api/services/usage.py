@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # USD per million tokens: (prompt_price, completion_price)
 _PRICING: dict[str, tuple[str, str]] = {
     "anthropic/claude-sonnet-4.6": ("3", "15"),
+    "openai/gpt-5.5": ("5", "30"),
     "x-ai/grok-4.3": ("1.25", "2.5"),
     "google/gemini-3.1-flash-lite": ("0.25", "1.5"),
     "google/gemini-3.1-flash-lite-preview": ("0.25", "1.5"),

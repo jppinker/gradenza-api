@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 import gradenza_api.routes.online_lessons as online_lessons
 from gradenza_api.auth import AuthUser
+from gradenza_api.services.openrouter import OpenRouterHTTPError
 
 
 LESSON_ID = "11111111-1111-4111-8111-111111111111"
@@ -31,6 +32,20 @@ def _result(content: str, model: str = "google/gemini-2.5-flash") -> MagicMock:
     result.content = content
     result.usage = _usage(model)
     return result
+
+
+def test_online_lesson_model_unavailable_error_is_explicit() -> None:
+    exc = OpenRouterHTTPError(404, '{"error":"model not found: openai/gpt-5.5"}')
+
+    detail = online_lessons._online_lesson_ai_error_detail(
+        exc,
+        model="openai/gpt-5.5",
+        env_var="ONLINE_LESSON_CHAT_MODEL",
+    )
+
+    assert "openai/gpt-5.5" in detail
+    assert "ONLINE_LESSON_CHAT_MODEL" in detail
+    assert "unavailable or invalid" in detail
 
 
 @pytest.fixture(autouse=True)

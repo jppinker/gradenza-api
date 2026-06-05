@@ -14,6 +14,7 @@ import asyncio
 import logging
 import time
 
+from gradenza_api.jobs.analyze_attachment import analyze_attachment
 from gradenza_api.jobs.generate_quiz import generate_quiz
 from gradenza_api.jobs.process_submission import process_submission
 from gradenza_api.redis_config import build_redis_settings
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 class WorkerSettings:
     """ARQ worker configuration."""
 
-    functions = [generate_quiz, process_submission]
+    functions = [analyze_attachment, generate_quiz, process_submission]
     redis_settings = build_redis_settings()
 
     # How many jobs to run concurrently

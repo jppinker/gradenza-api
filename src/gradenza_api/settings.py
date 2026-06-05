@@ -26,12 +26,15 @@ class Settings(BaseSettings):
     submission_photos_bucket: str = "submission-photos"
 
     # ── Online lesson AI models ────────────────────────────────────────────────
-    # All online-lesson AI calls use the stable Gemini 2.5 Flash model.
-    # google/gemini-2.5-flash-preview-05-20 is no longer available on OpenRouter.
-    online_lesson_chat_model: str = "google/gemini-2.5-flash"
+    # Chat and question generation use GPT-5.5 via OpenRouter.
+    # Plan, revise, and homework remain on Gemini 2.5 Flash.
+    # Override any value via its corresponding environment variable (see .env.example).
+    # Rollback: set ONLINE_LESSON_CHAT_MODEL / ONLINE_LESSON_QUESTIONS_MODEL to
+    #   google/gemini-2.5-flash
+    online_lesson_chat_model: str = "openai/gpt-5.5"
     online_lesson_plan_model: str = "google/gemini-2.5-flash"
     online_lesson_revise_model: str = "google/gemini-2.5-flash"
-    online_lesson_questions_model: str = "google/gemini-2.5-flash"
+    online_lesson_questions_model: str = "openai/gpt-5.5"
     online_lesson_homework_model: str = "google/gemini-2.5-flash"
 
     @property
