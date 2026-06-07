@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Annotated
 
@@ -164,7 +165,12 @@ async def process_submission(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Background queue temporarily unavailable. Please retry shortly.",
         )
-    job_id = f"process_submission_{submission_id}"
+    # Include unix-second timestamp so that a completed job's result (kept for
+    # keep_result=3600 s) does not silently block re-enqueuing after a student
+    # edits their photos.  Rapid duplicate calls within the same second are still
+    # deduplicated by ARQ; edits (which take longer than 1 s to complete) always
+    # produce a fresh job_id and are never dropped.
+    job_id = f"process_submission_{submission_id}_{int(time.time())}"
 
     job = await redis.enqueue_job(
         "process_submission",
