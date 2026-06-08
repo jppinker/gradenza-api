@@ -291,6 +291,86 @@ def _fetch_qb_generated_row(source_id: str) -> dict | None:
     return result.data
 
 
+def _fetch_waec_questionbank_row(source_id: str) -> dict | None:
+    """Fetch a waec_math_questionbank row by question_id (used as source_id)."""
+    svc = get_service_client()
+    result = (
+        svc.table("waec_math_questionbank")
+        .select(
+            "question_id, problem_text, choices_json, correct_answer, "
+            "answers_text, solution_text, image_path"
+        )
+        .eq("question_id", source_id)
+        .maybe_single()
+        .execute()
+    )
+    return result.data
+
+
+def _parsed_question_from_waec_row(
+    row: dict,
+    assignment_question_id: str,
+    question_uuid: str,
+    source_id: str,
+) -> "ParsedQuestion":
+    """Convert a waec_math_questionbank row into a ParsedQuestion."""
+    import json as _json
+
+    q_text = str(row.get("problem_text") or "")
+
+    # Parse choices and append to question text
+    raw_choices = row.get("choices_json")
+    choices_list: list[str] = []
+    if raw_choices:
+        try:
+            parsed = _json.loads(raw_choices) if isinstance(raw_choices, str) else raw_choices
+            if isinstance(parsed, list):
+                for idx, item in enumerate(parsed):
+                    if isinstance(item, dict):
+                        key = item.get("key") or item.get("option") or chr(65 + idx)
+                        text = item.get("text") or item.get("value") or ""
+                        choices_list.append(f"{key}. {text}")
+                    else:
+                        choices_list.append(f"{chr(65 + idx)}. {item}")
+            elif isinstance(parsed, dict):
+                for key, text in parsed.items():
+                    choices_list.append(f"{key}. {text}")
+        except Exception:
+            pass
+
+    if choices_list:
+        q_text = q_text + "\n\n" + "\n".join(choices_list)
+
+    correct = str(
+        row.get("correct_answer") or row.get("answers_text") or ""
+    ).strip()
+    solution = str(row.get("solution_text") or "").strip()
+
+    ms_text = f"Correct answer: {correct}." if correct else "Correct answer provided in source record."
+    if solution:
+        ms_text += f" {solution}"
+
+    step = ParsedMarkschemeStep(
+        part_label=None,
+        description=ms_text,
+        marks=1,
+        mark_type=None,
+    )
+
+    return ParsedQuestion(
+        question_uuid=question_uuid,
+        source_id=source_id,
+        problem_text=q_text,
+        parts=[],
+        markscheme_steps=[step],
+        marks_available=1,
+        diagram_required=bool(row.get("image_path")),
+        ft_eligible_parts=[],
+        ft_dependencies={},
+        assignment_question_id=assignment_question_id,
+    )
+
+
 # ── Quiz ParsedQuestion builder (3b) ─────────────────────────────────────────
 
 def _parsed_question_from_quiz_json(
@@ -734,7 +814,7 @@ async def process_submission(
     def _fetch_submission_scope() -> dict | None:
         res = (
             svc.table("submissions")
-            .select("id, status, student_id, assignment_id, assignment_question_id")
+            .select("id, status, student_id, assignment_id, assignment_question_id, assignments(created_by)")
             .eq("id", submission_id)
             .maybe_single()
             .execute()
@@ -746,8 +826,15 @@ async def process_submission(
         await asyncio.to_thread(_set_processing_error, "submission_not_found")
         return {"submission_id": submission_id, "error": "submission_not_found"}
 
-    # user_id for all usage events in this job: the student who owns the submission
-    job_user_id: str = submission_scope.get("student_id") or ""
+    # user_id for all usage events: the teacher/tutor who created the assignment
+    _scope_asgn = submission_scope.get("assignments") or {}
+    if isinstance(_scope_asgn, list):
+        _scope_asgn = _scope_asgn[0] if _scope_asgn else {}
+    job_user_id: str = (
+        _scope_asgn.get("created_by")
+        or submission_scope.get("student_id")
+        or ""
+    )
 
     submission_aqid = submission_scope.get("assignment_question_id")
     if has_assignment_question_id:
@@ -916,9 +1003,12 @@ async def process_submission(
         )
         return {"submission_id": submission_id, "skipped": True, "reason": f"status is {submission_row.get('status')}"}
 
-    # Refresh user_id in case student_id was missing from the initial scope fetch
+    # Refresh user_id in case it was missing from the initial scope fetch
     if not job_user_id:
-        job_user_id = submission_row.get("student_id") or ""
+        _asgn_row = submission_row.get("assignments") or {}
+        if isinstance(_asgn_row, list):
+            _asgn_row = _asgn_row[0] if _asgn_row else {}
+        job_user_id = _asgn_row.get("created_by") or submission_row.get("student_id") or ""
 
     submission_aqid = submission_row.get("assignment_question_id")
     if has_assignment_question_id:
@@ -1152,6 +1242,22 @@ async def process_submission(
                 question_uuid=str(q_row.get("id")),
                 source_id=source_id,
                 diagram_required=bool(q_row.get("diagram_required")),
+            )
+            questions.append(parsed)
+            continue
+
+        if source_table == "waec_math_questionbank":
+            raw_waec_row = await asyncio.to_thread(_fetch_waec_questionbank_row, source_id)
+            if not raw_waec_row:
+                logger.warning(
+                    "[job] waec_math_questionbank row not found for source_id=%s", source_id
+                )
+                continue
+            parsed = _parsed_question_from_waec_row(
+                row=raw_waec_row,
+                assignment_question_id=str(aq["id"]),
+                question_uuid=str(q_row.get("id")),
+                source_id=source_id,
             )
             questions.append(parsed)
             continue
