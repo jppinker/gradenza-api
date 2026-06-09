@@ -24,6 +24,7 @@ re-queued jobs always begin from a clean state.
   photo_fetch_error         DB exception while querying submission_photos
   no_photos                 No rows found after PHOTO_FETCH_ATTEMPTS retries
   storage_download_error    Supabase Storage download returned None/failed
+  ocr_service_error         OpenRouter call raised during OCR (transient provider failure)
   ocr_incomplete            Not all photos have ocr_done_at after OCR loop
   assignment_question_id mismatch  Submission/question scoping mismatch (safety abort)
   submission_not_found      submissions row missing when refetched for grading
@@ -31,6 +32,8 @@ re-queued jobs always begin from a clean state.
   no_assignment_questions   assignment_questions empty for this assignment
   no_resolvable_questions   All question rows failed to resolve from source table
   db_write_error            One or more grading_results upserts failed
+  job_timeout               ARQ cancelled the job (job_timeout exceeded or worker shutdown)
+  internal_error            Unexpected exception not covered by a specific code above
 
 Status enum: draft | submitted | ocr_done | graded | reviewed  (no "failed").
 """
@@ -43,7 +46,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from gradenza_api.services.openrouter import call_openrouter, strip_json_fences
@@ -52,6 +55,12 @@ from gradenza_api.services.usage import AIUsage, record_ai_usage
 from gradenza_api.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _msd(res: Any) -> dict | None:
+    """Return res.data safely when maybe_single().execute() may return None."""
+    return res.data if res is not None else None
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -98,6 +107,22 @@ Respond ONLY with valid JSON. No markdown fences, no preamble, no explanation.""
 
 def _clamp01(n: float) -> float:
     return max(0.0, min(1.0, n))
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    """Coerce val to int, returning default on TypeError/ValueError (e.g. "2/5", "three")."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Coerce val to float, returning default on TypeError/ValueError (e.g. "high", "n/a")."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
 
 
 def _mime_for_path(path: str) -> str:
@@ -160,7 +185,11 @@ async def _run_ocr(
     user_id: str,
     submission_id: str,
 ) -> tuple[str, float]:
-    """Run OCR via OpenRouter. Returns (text, confidence). Records usage event."""
+    """Run OCR via OpenRouter. Returns (text, confidence). Records usage event.
+
+    Raises the underlying exception if the OpenRouter call fails so the caller
+    can set processing_error without writing ocr_done_at.
+    """
     messages = [
         {"role": "system", "content": OCR_SYSTEM_PROMPT},
         {
@@ -205,7 +234,7 @@ async def _run_ocr(
             status="error",
             error_message=str(exc),
         )
-        return "", 0.0
+        raise
 
     await record_ai_usage(
         svc,
@@ -221,6 +250,8 @@ async def _run_ocr(
     stripped = strip_json_fences(raw)
     try:
         parsed = json.loads(stripped)
+        if not isinstance(parsed, dict):
+            raise TypeError("OCR response is not a JSON object")
         text = parsed.get("text", raw) if isinstance(parsed.get("text"), str) else raw
         conf = _clamp01(float(parsed["confidence"])) if isinstance(parsed.get("confidence"), (int, float)) else 0.5
         return text, conf
@@ -272,7 +303,7 @@ def _fetch_quiz_question_row(source_id: str) -> dict | None:
         .maybe_single()
         .execute()
     )
-    return result.data
+    return _msd(result)
 
 
 def _fetch_qb_generated_row(source_id: str) -> dict | None:
@@ -288,7 +319,7 @@ def _fetch_qb_generated_row(source_id: str) -> dict | None:
         .maybe_single()
         .execute()
     )
-    return result.data
+    return _msd(result)
 
 
 def _fetch_waec_questionbank_row(source_id: str) -> dict | None:
@@ -304,7 +335,7 @@ def _fetch_waec_questionbank_row(source_id: str) -> dict | None:
         .maybe_single()
         .execute()
     )
-    return result.data
+    return _msd(result)
 
 
 def _parsed_question_from_waec_row(
@@ -725,7 +756,11 @@ Grade this question following the IB marking conventions in the system prompt. R
 
     stripped = strip_json_fences(raw)
     try:
-        return json.loads(stripped)
+        parsed = json.loads(stripped)
+        if not isinstance(parsed, dict):
+            logger.warning("[grade] LLM returned non-object JSON; raw preview: %s", raw[:200])
+            return None
+        return parsed
     except json.JSONDecodeError:
         logger.warning("[grade] JSON parse failed; raw preview: %s", raw[:200])
         return None
@@ -738,10 +773,43 @@ def _detect_amber(ocr_text: str, llm_result: dict | None) -> tuple[bool, str | N
         return True, "Crossed-out or overwritten work detected in OCR transcription"
     if llm_result is None:
         return True, "Grading LLM call failed — manual review required"
-    confidence = float(llm_result.get("confidence") or 1.0)
+    confidence = _safe_float(
+        llm_result.get("confidence") if llm_result.get("confidence") is not None else 1.0,
+        default=0.0,
+    )
     if confidence < LLM_LOW_CONFIDENCE:
         return True, f"LLM confidence {confidence * 100:.0f}% below threshold — uncertain grading"
     return False, None
+
+
+def _fallback_part_label(index: int) -> str:
+    if 0 <= index < 26:
+        return chr(97 + index)
+    return str(index + 1)
+
+
+def _normalize_llm_part_labels(llm_result: dict | None, question: ParsedQuestion) -> None:
+    """Ensure serialized LLM assessment parts always have displayable labels."""
+    if not llm_result:
+        return
+
+    parts = llm_result.get("parts")
+    if not isinstance(parts, list):
+        return
+
+    for idx, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
+
+        raw_label = part.get("part_label")
+        if isinstance(raw_label, str) and raw_label.strip():
+            part["part_label"] = raw_label.strip().lower()
+            continue
+
+        if idx < len(question.parts) and question.parts[idx].label:
+            part["part_label"] = question.parts[idx].label.lower()
+        else:
+            part["part_label"] = _fallback_part_label(idx)
 
 
 def _classify_trust_layer(
@@ -754,6 +822,88 @@ def _classify_trust_layer(
     return "layer1_auto"
 
 
+# ── Credit cap guard ──────────────────────────────────────────────────────────
+
+_PERIOD_DAYS = 30
+_PERIOD_SECS = _PERIOD_DAYS * 86_400
+
+
+def _is_over_credit_cap(user_id: str) -> bool:
+    """
+    Return True if the user has consumed >= their effective credit cap this period.
+    Mirrors the TypeScript getCreditUsage(userId).atCap logic.
+    Returns False (allow) on any DB error so a billing-service hiccup never
+    blocks grading permanently.
+    """
+    try:
+        svc = get_service_client()
+
+        sub_res = (
+            svc.table("v_effective_subscription")
+            .select("credit_cap, via_school, workspace_id")
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        sub = _msd(sub_res) or {}
+        credit_cap = sub.get("credit_cap")
+        if credit_cap is None:
+            return False  # unlimited tier
+
+        via_school: bool = bool(sub.get("via_school"))
+        workspace_id: str | None = sub.get("workspace_id")
+
+        # Billing period anchored to account creation date (30-day rolling)
+        user_res = (
+            svc.table("users")
+            .select("created_at")
+            .eq("id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        user_row = _msd(user_res) or {}
+        created_at_str: str | None = user_row.get("created_at")
+        if created_at_str:
+            anchor = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+        else:
+            anchor = datetime.now(timezone.utc) - timedelta(seconds=_PERIOD_SECS)
+
+        now = datetime.now(timezone.utc)
+        elapsed = (now - anchor).total_seconds()
+        k = max(0, int(elapsed // _PERIOD_SECS))
+        period_start = (anchor + timedelta(seconds=k * _PERIOD_SECS)).isoformat()
+        period_end = (anchor + timedelta(seconds=(k + 1) * _PERIOD_SECS)).isoformat()
+
+        if via_school and workspace_id:
+            used_res = svc.rpc("workspace_credits_used_in_period", {
+                "p_workspace_id": workspace_id,
+                "p_period_start": period_start,
+                "p_period_end": period_end,
+            }).execute()
+        else:
+            used_res = svc.rpc("credits_used_in_period", {
+                "p_user_id": user_id,
+                "p_period_start": period_start,
+                "p_period_end": period_end,
+            }).execute()
+        used: int = used_res.data or 0
+
+        bonus_res = (
+            svc.table("credit_bonuses")
+            .select("amount")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        bonus: int = sum(row.get("amount", 0) for row in (bonus_res.data or []))
+
+        effective_cap = credit_cap + bonus
+        return used >= effective_cap
+
+    except Exception as exc:
+        logger.warning("[job] credit cap check failed for user=%s: %s — allowing", user_id, exc)
+        return False
+
+
 # ── Main job function ─────────────────────────────────────────────────────────
 
 async def process_submission(
@@ -762,10 +912,11 @@ async def process_submission(
     assignment_question_id: str | None = None,
     has_assignment_question_id: bool = False,
     force: bool = False,
+    retry_count: int = 0,
 ) -> dict:
     """
     ARQ job: orchestrate OCR + grading for one submission.
-    ctx is the ARQ job context (we don't use any special context values here).
+    ctx['redis'] is the ArqRedis pool injected by the worker at startup.
     """
     # Backward compatibility: older enqueues passed (submission_id, force)
     if isinstance(assignment_question_id, bool) and has_assignment_question_id is False:
@@ -780,6 +931,56 @@ async def process_submission(
         assignment_question_id,
         has_assignment_question_id,
     )
+
+    # ── Per-submission concurrency lock ───────────────────────────────────────
+    # Prevents two concurrent jobs for the same submission (e.g. student submit
+    # racing with teacher "Start AutoGrade", or two retries > 1 s apart).
+    # TTL matches job_timeout so the lock is never permanently orphaned.
+    #
+    # On contention we re-enqueue with a 30-second deferral (up to 5 retries)
+    # instead of dropping the job — otherwise a student edit that races job A
+    # causes job B to be silently discarded, leaving processing_error persisted.
+    _redis = ctx.get("redis")
+    _lock_key = f"lock:process_submission:{submission_id}"
+    _lock_ttl = 660  # seconds — slightly over job_timeout (600 s)
+    _LOCK_DEFER_SECONDS = 30
+    _MAX_LOCK_RETRIES = 5
+    _lock_acquired = False
+    if _redis is not None:
+        _lock_acquired = bool(await _redis.set(_lock_key, "1", nx=True, ex=_lock_ttl))
+        if not _lock_acquired:
+            if retry_count < _MAX_LOCK_RETRIES:
+                logger.info(
+                    "[job] submission=%s already in progress — deferring retry %d/%d",
+                    submission_id, retry_count + 1, _MAX_LOCK_RETRIES,
+                )
+                await _redis.enqueue_job(
+                    "process_submission",
+                    submission_id,
+                    assignment_question_id,
+                    has_assignment_question_id,
+                    force,
+                    retry_count + 1,
+                    _defer_by=timedelta(seconds=_LOCK_DEFER_SECONDS),
+                )
+                return {
+                    "submission_id": submission_id,
+                    "skipped": "concurrent_job",
+                    "deferred": True,
+                    "retry_count": retry_count + 1,
+                }
+            else:
+                logger.error(
+                    "[job] submission=%s lock contention — max retries (%d) exhausted, giving up",
+                    submission_id, _MAX_LOCK_RETRIES,
+                )
+                return {
+                    "submission_id": submission_id,
+                    "skipped": "concurrent_job",
+                    "deferred": False,
+                    "retry_count": retry_count,
+                }
+
     svc = get_service_client()
 
     # ── Error helpers (closures over svc + submission_id) ──────────────────────
@@ -800,6 +1001,7 @@ async def process_submission(
             svc.table("submissions").update({
                 "processing_error": code,
                 "processing_error_at": datetime.now(timezone.utc).isoformat(),
+                "mock_phase": "error",
             }).eq("id", submission_id).execute()
         except Exception as exc:
             logger.error(
@@ -807,634 +1009,686 @@ async def process_submission(
                 submission_id, code, exc,
             )
 
+    def _set_mock_phase(phase: str) -> None:
+        try:
+            svc.table("submissions").update({"mock_phase": phase}).eq("id", submission_id).execute()
+        except Exception as exc:
+            logger.warning("[job] submission=%s: could not write mock_phase=%s: %s", submission_id, phase, exc)
+
     # Clear any error left by a previous attempt so the frontend stops showing it.
     await asyncio.to_thread(_clear_processing_error)
 
-    # ── Safety: validate submission ↔ AQID scoping ───────────────────────────
-    def _fetch_submission_scope() -> dict | None:
-        res = (
-            svc.table("submissions")
-            .select("id, status, student_id, assignment_id, assignment_question_id, assignments(created_by)")
-            .eq("id", submission_id)
-            .maybe_single()
-            .execute()
-        )
-        return res.data
-
-    submission_scope = await asyncio.to_thread(_fetch_submission_scope)
-    if not submission_scope:
-        await asyncio.to_thread(_set_processing_error, "submission_not_found")
-        return {"submission_id": submission_id, "error": "submission_not_found"}
-
-    # user_id for all usage events: the teacher/tutor who created the assignment
-    _scope_asgn = submission_scope.get("assignments") or {}
-    if isinstance(_scope_asgn, list):
-        _scope_asgn = _scope_asgn[0] if _scope_asgn else {}
-    job_user_id: str = (
-        _scope_asgn.get("created_by")
-        or submission_scope.get("student_id")
-        or ""
-    )
-
-    submission_aqid = submission_scope.get("assignment_question_id")
-    if has_assignment_question_id:
-        if submission_aqid != assignment_question_id:
-            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
-            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
-    else:
-        assignment_question_id = submission_aqid
-
-    is_question_scoped = submission_aqid is not None
-
-    # ── 1. Fetch submission_photos (with retry for eventual consistency) ─────────
-    # submission_photos rows may arrive slightly after the job is enqueued (the
-    # Storage trigger is asynchronous), so we retry a few times before giving up.
-    def _fetch_photos() -> list[dict]:
-        res = (
-            svc.table("submission_photos")
-            .select("id, submission_id, question_id, page_number, storage_path, ocr_done_at")
-            .eq("submission_id", submission_id)
-            .order("page_number")
-            .execute()
-        )
-        return res.data or []
-
     try:
-        photos = await _fetch_photos_retrying(_fetch_photos, submission_id)
-    except Exception as exc:
-        logger.error(
-            "[job] submission=%s: photo fetch failed after %d attempts: %s",
-            submission_id, PHOTO_FETCH_ATTEMPTS, exc,
-        )
-        await asyncio.to_thread(_set_processing_error, "photo_fetch_error")
-        return {"submission_id": submission_id, "error": "photo_fetch_error"}
-
-    if not photos:
-        logger.error(
-            "[job] submission=%s: no photos after %d attempts — upload may not have completed",
-            submission_id, PHOTO_FETCH_ATTEMPTS,
-        )
-        await asyncio.to_thread(_set_processing_error, "no_photos")
-        return {"submission_id": submission_id, "error": "no_photos"}
-
-    # ── Safety: ensure fetched photos are correctly scoped ─────────
-    wrong_submission_ids = {
-        p.get("submission_id")
-        for p in photos
-        if p.get("submission_id") and p.get("submission_id") != submission_id
-    }
-    if wrong_submission_ids:
-        await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
-        return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
-
-    if is_question_scoped:
-        wrong_photo_aqids = {
-            p.get("question_id")
-            for p in photos
-            if p.get("question_id") not in (None, submission_aqid)
-        }
-        if wrong_photo_aqids:
-            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
-            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
-
-    # ── 2. OCR each unprocessed photo ─────────────────────────────
-    for photo in photos:
-        if photo.get("ocr_done_at") and not force:
-            logger.debug("[job] photo %s already processed — skip", photo["id"])
-            continue
-
-        storage_path: str = photo["storage_path"]
-        bucket: str = settings.submission_photos_bucket
-
-        # Download from Supabase Storage
-        def _download(b: str, p: str) -> bytes | None:
-            try:
-                return svc.storage.from_(b).download(p)
-            except Exception as exc:
-                logger.error("[job] storage download failed bucket=%s path=%s: %s", b, p, exc)
-                return None
-
-        raw_bytes = await asyncio.to_thread(_download, bucket, storage_path)
-
-        if raw_bytes is None:
-            await asyncio.to_thread(_set_processing_error, "storage_download_error")
-            return {"submission_id": submission_id, "error": "storage_download_error"}
-
-        mime_type = _mime_for_path(storage_path)
-
-        image_base64 = base64.b64encode(raw_bytes).decode("utf-8")
-
-        ocr_text, ocr_confidence = await _run_ocr(
-            image_base64,
-            mime_type,
-            user_id=job_user_id,
-            submission_id=submission_id,
-        )
-
-        # Write OCR result
-        def _write_ocr(photo_id: str, text: str, conf: float) -> None:
-            svc.table("submission_photos").update({
-                "ocr_text": text,
-                "ocr_confidence": conf,
-                "ocr_done_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("id", photo_id).execute()
-
-        await asyncio.to_thread(_write_ocr, photo["id"], ocr_text, ocr_confidence)
-        logger.info(
-            "[job] OCR done photo=%s page=%s confidence=%.2f",
-            photo["id"],
-            photo.get("page_number"),
-            ocr_confidence,
-        )
-
-    # ── 3. Check if all pages are done ────────────────────────────
-    def _check_all_done() -> list[dict]:
-        res = (
-            svc.table("submission_photos")
-            .select("ocr_done_at")
-            .eq("submission_id", submission_id)
-            .execute()
-        )
-        return res.data or []
-
-    all_photos = await asyncio.to_thread(_check_all_done)
-    all_done = bool(all_photos) and all(p.get("ocr_done_at") for p in all_photos)
-
-    if not all_done:
-        logger.error("[job] submission=%s: not all photos OCR'd", submission_id)
-        await asyncio.to_thread(_set_processing_error, "ocr_incomplete")
-        return {"submission_id": submission_id, "error": "ocr_incomplete"}
-
-    # Advance status from 'submitted' → 'ocr_done' (idempotent)
-    def _advance_to_ocr_done() -> None:
-        svc.table("submissions").update({"status": "ocr_done"}).eq(
-            "id", submission_id
-        ).eq("status", "submitted").execute()
-
-    await asyncio.to_thread(_advance_to_ocr_done)
-
-    # ── 4. Grading ────────────────────────────────────────────────
-
-    # 4a. Fetch submission + assignment
-    def _fetch_submission() -> dict | None:
-        res = (
-            svc.table("submissions")
-            .select(
-                "id, status, student_id, assignment_id, assignment_question_id, "
-                "assignments(id, grading_style, class_id, classes(id, exam_system_id, exam_systems(id, code)))"
-            )
-            .eq("id", submission_id)
-            .maybe_single()
-            .execute()
-        )
-        return res.data
-
-    submission_row = await asyncio.to_thread(_fetch_submission)
-    if not submission_row:
-        logger.error("[job] submission=%s not found", submission_id)
-        await asyncio.to_thread(_set_processing_error, "submission_not_found")
-        return {"submission_id": submission_id, "error": "submission_not_found"}
-
-    if submission_row.get("status") != "ocr_done":
-        logger.warning(
-            "[job] submission %s status=%s — skip grading",
-            submission_id,
-            submission_row.get("status"),
-        )
-        return {"submission_id": submission_id, "skipped": True, "reason": f"status is {submission_row.get('status')}"}
-
-    # Refresh user_id in case it was missing from the initial scope fetch
-    if not job_user_id:
-        _asgn_row = submission_row.get("assignments") or {}
-        if isinstance(_asgn_row, list):
-            _asgn_row = _asgn_row[0] if _asgn_row else {}
-        job_user_id = _asgn_row.get("created_by") or submission_row.get("student_id") or ""
-
-    submission_aqid = submission_row.get("assignment_question_id")
-    if has_assignment_question_id:
-        if submission_aqid != assignment_question_id:
-            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
-            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
-    else:
-        assignment_question_id = submission_aqid
-
-    is_question_scoped = submission_aqid is not None
-
-    assignment = submission_row.get("assignments") or {}
-    if isinstance(assignment, list):
-        assignment = assignment[0] if assignment else {}
-    grading_style: str = assignment.get("grading_style") or "ib_style"
-
-    classes = assignment.get("classes") or {}
-    if isinstance(classes, list):
-        classes = classes[0] if classes else {}
-    exam_systems = classes.get("exam_systems") or {}
-    if isinstance(exam_systems, list):
-        exam_systems = exam_systems[0] if exam_systems else {}
-
-    exam_system_code: str = exam_systems.get("code") or ""
-    # Fallback chain: class.exam_system_id → source_table lookup (see below)
-    exam_system_id: str = classes.get("exam_system_id") or ""
-
-    # If still unresolved, derive from the first question's source_table
-    if not exam_system_id:
-        _SOURCE_TABLE_TO_SYSTEM_CODE: dict[str, str] = {
-            "waec_math_questionbank": "WAEC",
-        }
-
-        def _fetch_source_table_hint() -> str | None:
+        # ── Safety: validate submission ↔ AQID scoping ───────────────────────────
+        def _fetch_submission_scope() -> dict | None:
             res = (
-                svc.table("assignment_questions")
-                .select("questions(source_table)")
-                .eq("assignment_id", submission_row.get("assignment_id", ""))
-                .limit(1)
+                svc.table("submissions")
+                .select("id, status, student_id, assignment_id, assignment_question_id, assignments(created_by)")
+                .eq("id", submission_id)
                 .maybe_single()
                 .execute()
             )
-            if not res.data:
-                return None
-            q = res.data.get("questions") or {}
-            if isinstance(q, list):
-                q = q[0] if q else {}
-            return q.get("source_table")  # type: ignore[return-value]
+            return _msd(res)
 
-        source_table_hint = await asyncio.to_thread(_fetch_source_table_hint)
-        derived_code = _SOURCE_TABLE_TO_SYSTEM_CODE.get(source_table_hint or "", "IB")
-        if not exam_system_code:
-            exam_system_code = derived_code
+        submission_scope = await asyncio.to_thread(_fetch_submission_scope)
+        if not submission_scope:
+            await asyncio.to_thread(_set_processing_error, "submission_not_found")
+            return {"submission_id": submission_id, "error": "submission_not_found"}
 
-        def _fetch_exam_system_by_code() -> dict | None:
+        # user_id for all usage events: the teacher/tutor who created the assignment
+        _scope_asgn = submission_scope.get("assignments") or {}
+        if isinstance(_scope_asgn, list):
+            _scope_asgn = _scope_asgn[0] if _scope_asgn else {}
+        job_user_id: str = (
+            _scope_asgn.get("created_by")
+            or submission_scope.get("student_id")
+            or ""
+        )
+
+        submission_aqid = submission_scope.get("assignment_question_id")
+        if has_assignment_question_id:
+            # Reject only when this is a per-question submission whose column
+            # disagrees with the caller.  When submission_aqid is NULL (legacy
+            # full-assignment submission) the caller AQID is a grading-scope filter
+            # and must be allowed through.
+            if submission_aqid is not None and submission_aqid != assignment_question_id:
+                await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+                return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+        else:
+            assignment_question_id = submission_aqid
+
+        is_question_scoped = assignment_question_id is not None
+
+        # ── Credit cap guard ──────────────────────────────────────────
+        # Re-checked here so that a burst of jobs enqueued while the account was
+        # just under cap cannot all run to completion and overshoot the cap.
+        if job_user_id:
+            over_cap = await asyncio.to_thread(_is_over_credit_cap, job_user_id)
+            if over_cap:
+                logger.warning(
+                    "[job] submission=%s user=%s is over credit cap — aborting",
+                    submission_id, job_user_id,
+                )
+                await asyncio.to_thread(_set_processing_error, "enqueue_insufficient_credits")
+                return {"submission_id": submission_id, "error": "enqueue_insufficient_credits"}
+
+        # ── 1. Fetch submission_photos (with retry for eventual consistency) ─────────
+        # submission_photos rows may arrive slightly after the job is enqueued (the
+        # Storage trigger is asynchronous), so we retry a few times before giving up.
+        def _fetch_photos() -> list[dict]:
             res = (
-                svc.table("exam_systems")
-                .select("id, code")
-                .eq("code", exam_system_code)
+                svc.table("submission_photos")
+                .select("id, submission_id, question_id, page_number, storage_path, ocr_done_at")
+                .eq("submission_id", submission_id)
+                .order("page_number")
+                .execute()
+            )
+            return res.data or []
+
+        try:
+            photos = await _fetch_photos_retrying(_fetch_photos, submission_id)
+        except Exception as exc:
+            logger.error(
+                "[job] submission=%s: photo fetch failed after %d attempts: %s",
+                submission_id, PHOTO_FETCH_ATTEMPTS, exc,
+            )
+            await asyncio.to_thread(_set_processing_error, "photo_fetch_error")
+            return {"submission_id": submission_id, "error": "photo_fetch_error"}
+
+        if not photos:
+            logger.error(
+                "[job] submission=%s: no photos after %d attempts — upload may not have completed",
+                submission_id, PHOTO_FETCH_ATTEMPTS,
+            )
+            await asyncio.to_thread(_set_processing_error, "no_photos")
+            return {"submission_id": submission_id, "error": "no_photos"}
+
+        # ── Safety: ensure fetched photos are correctly scoped ─────────
+        wrong_submission_ids = {
+            p.get("submission_id")
+            for p in photos
+            if p.get("submission_id") and p.get("submission_id") != submission_id
+        }
+        if wrong_submission_ids:
+            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+
+        if is_question_scoped:
+            wrong_photo_aqids = {
+                p.get("question_id")
+                for p in photos
+                if p.get("question_id") not in (None, assignment_question_id)
+            }
+            if wrong_photo_aqids:
+                await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+                return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+
+        # ── 2. OCR each unprocessed photo ─────────────────────────────
+        await asyncio.to_thread(_set_mock_phase, "ocr")
+        for photo in photos:
+            if photo.get("ocr_done_at") and not force:
+                logger.debug("[job] photo %s already processed — skip", photo["id"])
+                continue
+
+            storage_path: str = photo["storage_path"]
+            bucket: str = settings.submission_photos_bucket
+
+            # Download from Supabase Storage
+            def _download(b: str, p: str) -> bytes | None:
+                try:
+                    return svc.storage.from_(b).download(p)
+                except Exception as exc:
+                    logger.error("[job] storage download failed bucket=%s path=%s: %s", b, p, exc)
+                    return None
+
+            raw_bytes = await asyncio.to_thread(_download, bucket, storage_path)
+
+            if raw_bytes is None:
+                await asyncio.to_thread(_set_processing_error, "storage_download_error")
+                return {"submission_id": submission_id, "error": "storage_download_error"}
+
+            mime_type = _mime_for_path(storage_path)
+
+            image_base64 = base64.b64encode(raw_bytes).decode("utf-8")
+
+            try:
+                ocr_text, ocr_confidence = await _run_ocr(
+                    image_base64,
+                    mime_type,
+                    user_id=job_user_id,
+                    submission_id=submission_id,
+                )
+            except Exception:
+                # Leave ocr_done_at NULL so retries will re-attempt this photo.
+                await asyncio.to_thread(_set_processing_error, "ocr_service_error")
+                return {"submission_id": submission_id, "error": "ocr_service_error"}
+
+            # Write OCR result
+            def _write_ocr(photo_id: str, text: str, conf: float) -> None:
+                svc.table("submission_photos").update({
+                    "ocr_text": text,
+                    "ocr_confidence": conf,
+                    "ocr_done_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", photo_id).execute()
+
+            await asyncio.to_thread(_write_ocr, photo["id"], ocr_text, ocr_confidence)
+            logger.info(
+                "[job] OCR done photo=%s page=%s confidence=%.2f",
+                photo["id"],
+                photo.get("page_number"),
+                ocr_confidence,
+            )
+
+        # ── 3. Check if all pages are done ────────────────────────────
+        def _check_all_done() -> list[dict]:
+            res = (
+                svc.table("submission_photos")
+                .select("ocr_done_at")
+                .eq("submission_id", submission_id)
+                .execute()
+            )
+            return res.data or []
+
+        all_photos = await asyncio.to_thread(_check_all_done)
+        all_done = bool(all_photos) and all(p.get("ocr_done_at") for p in all_photos)
+
+        if not all_done:
+            logger.error("[job] submission=%s: not all photos OCR'd", submission_id)
+            await asyncio.to_thread(_set_processing_error, "ocr_incomplete")
+            return {"submission_id": submission_id, "error": "ocr_incomplete"}
+
+        # Advance status from 'submitted' → 'ocr_done' (idempotent)
+        def _advance_to_ocr_done() -> None:
+            svc.table("submissions").update({"status": "ocr_done", "mock_phase": "extracting"}).eq(
+                "id", submission_id
+            ).eq("status", "submitted").execute()
+
+        await asyncio.to_thread(_advance_to_ocr_done)
+
+        # ── 4. Grading ────────────────────────────────────────────────
+
+        # 4a. Fetch submission + assignment
+        def _fetch_submission() -> dict | None:
+            res = (
+                svc.table("submissions")
+                .select(
+                    "id, status, student_id, assignment_id, assignment_question_id, "
+                    "assignments(id, grading_style, class_id, classes(id, exam_system_id, exam_systems(id, code)))"
+                )
+                .eq("id", submission_id)
+                .maybe_single()
+                .execute()
+            )
+            return _msd(res)
+
+        submission_row = await asyncio.to_thread(_fetch_submission)
+        if not submission_row:
+            logger.error("[job] submission=%s not found", submission_id)
+            await asyncio.to_thread(_set_processing_error, "submission_not_found")
+            return {"submission_id": submission_id, "error": "submission_not_found"}
+
+        current_status = submission_row.get("status")
+        if current_status not in ("ocr_done", "graded", "reviewed"):
+            logger.warning(
+                "[job] submission %s status=%s — OCR not complete, cannot grade",
+                submission_id,
+                current_status,
+            )
+            await asyncio.to_thread(_set_processing_error, f"unexpected_status_{current_status}")
+            return {"submission_id": submission_id, "error": f"unexpected_status_{current_status}"}
+
+        if current_status in ("graded", "reviewed"):
+            # Re-grade path: reset status so grading proceeds and result is authoritative.
+            def _reset_for_regrade() -> None:
+                svc.table("submissions").update({"status": "ocr_done"}).eq(
+                    "id", submission_id
+                ).execute()
+
+            logger.info(
+                "[job] submission=%s re-grading from status=%s",
+                submission_id,
+                current_status,
+            )
+            await asyncio.to_thread(_reset_for_regrade)
+
+        # Refresh user_id in case it was missing from the initial scope fetch
+        if not job_user_id:
+            _asgn_row = submission_row.get("assignments") or {}
+            if isinstance(_asgn_row, list):
+                _asgn_row = _asgn_row[0] if _asgn_row else {}
+            job_user_id = _asgn_row.get("created_by") or submission_row.get("student_id") or ""
+
+        submission_aqid = submission_row.get("assignment_question_id")
+        if has_assignment_question_id:
+            if submission_aqid is not None and submission_aqid != assignment_question_id:
+                await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+                return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+        else:
+            assignment_question_id = submission_aqid
+
+        is_question_scoped = assignment_question_id is not None
+
+        assignment = submission_row.get("assignments") or {}
+        if isinstance(assignment, list):
+            assignment = assignment[0] if assignment else {}
+        grading_style: str = assignment.get("grading_style") or "ib_style"
+
+        classes = assignment.get("classes") or {}
+        if isinstance(classes, list):
+            classes = classes[0] if classes else {}
+        exam_systems = classes.get("exam_systems") or {}
+        if isinstance(exam_systems, list):
+            exam_systems = exam_systems[0] if exam_systems else {}
+
+        exam_system_code: str = exam_systems.get("code") or ""
+        # Fallback chain: class.exam_system_id → source_table lookup (see below)
+        exam_system_id: str = classes.get("exam_system_id") or ""
+
+        # If still unresolved, derive from the first question's source_table
+        if not exam_system_id:
+            _SOURCE_TABLE_TO_SYSTEM_CODE: dict[str, str] = {
+                "waec_math_questionbank": "WAEC",
+            }
+
+            def _fetch_source_table_hint() -> str | None:
+                res = (
+                    svc.table("assignment_questions")
+                    .select("questions(source_table)")
+                    .eq("assignment_id", submission_row.get("assignment_id", ""))
+                    .limit(1)
+                    .maybe_single()
+                    .execute()
+                )
+                data = _msd(res)
+                if not data:
+                    return None
+                q = data.get("questions") or {}
+                if isinstance(q, list):
+                    q = q[0] if q else {}
+                return q.get("source_table")  # type: ignore[return-value]
+
+            source_table_hint = await asyncio.to_thread(_fetch_source_table_hint)
+            derived_code = _SOURCE_TABLE_TO_SYSTEM_CODE.get(source_table_hint or "", "IB")
+            if not exam_system_code:
+                exam_system_code = derived_code
+
+            def _fetch_exam_system_by_code() -> dict | None:
+                res = (
+                    svc.table("exam_systems")
+                    .select("id, code")
+                    .eq("code", exam_system_code)
+                    .eq("is_active", True)
+                    .maybe_single()
+                    .execute()
+                )
+                return _msd(res)
+
+            es_row = await asyncio.to_thread(_fetch_exam_system_by_code)
+            if es_row:
+                exam_system_id = es_row["id"]
+                exam_system_code = es_row["code"]
+            else:
+                logger.error(
+                    "[job] submission=%s: cannot resolve exam_system for assignment=%s (code=%s)",
+                    submission_id, submission_row.get("assignment_id"), exam_system_code,
+                )
+                await asyncio.to_thread(_set_processing_error, "no_exam_system")
+                return {"submission_id": submission_id, "error": "no_exam_system"}
+
+        if not exam_system_code:
+            exam_system_code = "IB"
+
+        # 4b. Fetch active grading prompt
+        def _fetch_prompt() -> dict | None:
+            res = (
+                svc.table("grading_prompt_versions")
+                .select("id, prompt_text, version_tag")
+                .eq("exam_system_id", exam_system_id)
                 .eq("is_active", True)
                 .maybe_single()
                 .execute()
             )
-            return res.data  # type: ignore[return-value]
+            return _msd(res)
 
-        es_row = await asyncio.to_thread(_fetch_exam_system_by_code)
-        if es_row:
-            exam_system_id = es_row["id"]
-            exam_system_code = es_row["code"]
-        else:
+        prompt_row = await asyncio.to_thread(_fetch_prompt)
+        if not prompt_row:
             logger.error(
-                "[job] submission=%s: cannot resolve exam_system for assignment=%s (code=%s)",
-                submission_id, submission_row.get("assignment_id"), exam_system_code,
+                "[job] submission=%s: no active grading prompt for exam_system_id=%s",
+                submission_id, exam_system_id,
             )
-            await asyncio.to_thread(_set_processing_error, "no_exam_system")
-            return {"submission_id": submission_id, "error": "no_exam_system"}
+            await asyncio.to_thread(_set_processing_error, "no_grading_prompt")
+            return {"submission_id": submission_id, "error": "no_grading_prompt"}
 
-    if not exam_system_code:
-        exam_system_code = "IB"
+        system_prompt: str = prompt_row["prompt_text"]
+        prompt_version_id: str = prompt_row["id"]
 
-    # 4b. Fetch active grading prompt
-    def _fetch_prompt() -> dict | None:
-        res = (
-            svc.table("grading_prompt_versions")
-            .select("id, prompt_text, version_tag")
-            .eq("exam_system_id", exam_system_id)
-            .eq("is_active", True)
-            .maybe_single()
-            .execute()
-        )
-        return res.data
+        # 4c. Fetch all OCR text
+        def _fetch_ocr_pages() -> list[dict]:
+            res = (
+                svc.table("submission_photos")
+                .select("submission_id, question_id, page_number, ocr_text, ocr_confidence")
+                .eq("submission_id", submission_id)
+                .order("page_number")
+                .execute()
+            )
+            return res.data or []
 
-    prompt_row = await asyncio.to_thread(_fetch_prompt)
-    if not prompt_row:
-        logger.error(
-            "[job] submission=%s: no active grading prompt for exam_system_id=%s",
-            submission_id, exam_system_id,
-        )
-        await asyncio.to_thread(_set_processing_error, "no_grading_prompt")
-        return {"submission_id": submission_id, "error": "no_grading_prompt"}
+        ocr_pages = await asyncio.to_thread(_fetch_ocr_pages)
 
-    system_prompt: str = prompt_row["prompt_text"]
-    prompt_version_id: str = prompt_row["id"]
-
-    # 4c. Fetch all OCR text
-    def _fetch_ocr_pages() -> list[dict]:
-        res = (
-            svc.table("submission_photos")
-            .select("submission_id, question_id, page_number, ocr_text, ocr_confidence")
-            .eq("submission_id", submission_id)
-            .order("page_number")
-            .execute()
-        )
-        return res.data or []
-
-    ocr_pages = await asyncio.to_thread(_fetch_ocr_pages)
-
-    wrong_ocr_submission_ids = {
-        p.get("submission_id")
-        for p in ocr_pages
-        if p.get("submission_id") and p.get("submission_id") != submission_id
-    }
-    if wrong_ocr_submission_ids:
-        await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
-        return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
-
-    if is_question_scoped:
-        wrong_ocr_aqids = {
-            p.get("question_id")
+        wrong_ocr_submission_ids = {
+            p.get("submission_id")
             for p in ocr_pages
-            if p.get("question_id") not in (None, submission_aqid)
+            if p.get("submission_id") and p.get("submission_id") != submission_id
         }
-        if wrong_ocr_aqids:
+        if wrong_ocr_submission_ids:
             await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
             return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
 
-    full_ocr_text = "\n\n--- Page break ---\n\n".join(
-        p["ocr_text"] for p in ocr_pages if p.get("ocr_text")
-    )
-    has_low_confidence_ocr = any(
-        p.get("ocr_confidence") is not None and float(p["ocr_confidence"]) < OCR_LOW_CONFIDENCE
-        for p in ocr_pages
-    )
+        if is_question_scoped:
+            wrong_ocr_aqids = {
+                p.get("question_id")
+                for p in ocr_pages
+                if p.get("question_id") not in (None, assignment_question_id)
+            }
+            if wrong_ocr_aqids:
+                await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+                return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
 
-    # 4d. Fetch assignment questions
-    def _fetch_aq_rows() -> list[dict]:
-        q = (
-            svc.table("assignment_questions")
-            .select(
-                "id, assignment_id, position, question_id, "
-                "questions(id, source_id, source_table, diagram_required, ft_eligible_parts, ft_dependencies)"
-            )
+        full_ocr_text = "\n\n--- Page break ---\n\n".join(
+            p["ocr_text"] for p in ocr_pages if p.get("ocr_text")
+        )
+        has_low_confidence_ocr = any(
+            p.get("ocr_confidence") is not None and float(p["ocr_confidence"]) < OCR_LOW_CONFIDENCE
+            for p in ocr_pages
         )
 
-        if is_question_scoped:
-            res = (
-                q.eq("id", submission_aqid)
-                .eq("assignment_id", assignment.get("id"))
-                .execute()
-            )
-        else:
-            res = (
-                q.eq("assignment_id", assignment.get("id"))
-                .order("position")
-                .execute()
-            )
-
-        return res.data or []
-
-    aq_rows = await asyncio.to_thread(_fetch_aq_rows)
-    if not aq_rows:
-        if is_question_scoped:
-            logger.error(
-                "[job] submission=%s: assignment_question_id=%s not found for assignment=%s",
-                submission_id,
-                submission_aqid,
-                assignment.get("id"),
-            )
-            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
-            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
-
-        logger.error("[job] submission=%s: no assignment_questions rows", submission_id)
-        await asyncio.to_thread(_set_processing_error, "no_assignment_questions")
-        return {"submission_id": submission_id, "error": "no_assignment_questions"}
-
-    # 4e. Resolve IB question details for each assignment question
-    questions: list[ParsedQuestion] = []
-
-    for aq in aq_rows:
-        q_row = aq.get("questions") or {}
-        if isinstance(q_row, list):
-            q_row = q_row[0] if q_row else {}
-        if not q_row:
-            logger.warning("[job] no question row for aq.id=%s", aq.get("id"))
-            continue
-
-        source_table: str = q_row.get("source_table") or "ib_math_questionbank"
-        source_id: str = str(q_row.get("source_id") or "")
-        if not source_id:
-            logger.warning("[job] question %s has no source_id", q_row.get("id"))
-            continue
-
-        # ── 3c: Quiz questions dispatch ───────────────────────────
-        if source_table == "quiz_questions":
-            raw_quiz_row = await asyncio.to_thread(_fetch_quiz_question_row, source_id)
-            if not raw_quiz_row:
-                logger.warning(
-                    "[job] quiz_question not found for source_id=%s", source_id
-                )
-                continue
-            question_json = raw_quiz_row.get("question_json") or {}
-            parsed = _parsed_question_from_quiz_json(
-                qj=question_json,
-                assignment_question_id=str(aq["id"]),
-                question_uuid=str(q_row.get("id")),
-                source_id=source_id,
-            )
-            questions.append(parsed)
-            continue
-
-        if source_table == "qb_generated":
-            raw_qb_row = await asyncio.to_thread(_fetch_qb_generated_row, source_id)
-            if not raw_qb_row:
-                logger.warning(
-                    "[job] qb_generated row not found for source_id=%s", source_id
-                )
-                continue
-            parsed = _parsed_question_from_qb_generated_row(
-                row=raw_qb_row,
-                assignment_question_id=str(aq["id"]),
-                question_uuid=str(q_row.get("id")),
-                source_id=source_id,
-                diagram_required=bool(q_row.get("diagram_required")),
-            )
-            questions.append(parsed)
-            continue
-
-        if source_table == "waec_math_questionbank":
-            raw_waec_row = await asyncio.to_thread(_fetch_waec_questionbank_row, source_id)
-            if not raw_waec_row:
-                logger.warning(
-                    "[job] waec_math_questionbank row not found for source_id=%s", source_id
-                )
-                continue
-            parsed = _parsed_question_from_waec_row(
-                row=raw_waec_row,
-                assignment_question_id=str(aq["id"]),
-                question_uuid=str(q_row.get("id")),
-                source_id=source_id,
-            )
-            questions.append(parsed)
-            continue
-
-        def _fetch_ib_row(sid: str) -> dict | None:
-            _IB_TABLES = ("ib_math_questionbank", "ib_new_math")
-            if source_table not in _IB_TABLES:
-                return None
-            res = (
-                svc.table(source_table)
+        # 4d. Fetch assignment questions
+        def _fetch_aq_rows() -> list[dict]:
+            q = (
+                svc.table("assignment_questions")
                 .select(
-                    "id, domain, theme, theme_slug, level, difficulty, problem_text, "
-                    "question_media_count, parts_count, parts_json, "
-                    "markscheme_steps_count, markscheme_steps_json"
+                    "id, assignment_id, position, question_id, "
+                    "questions(id, source_id, source_table, diagram_required, ft_eligible_parts, ft_dependencies)"
                 )
-                .eq("id", int(sid))
-                .maybe_single()
-                .execute()
-            )
-            return res.data
-
-        raw_row = await asyncio.to_thread(_fetch_ib_row, source_id)
-        if not raw_row:
-            logger.warning(
-                "[job] source row not found for source_id=%s table=%s", source_id, source_table
-            )
-            continue
-
-        parts = _parse_parts(raw_row.get("parts_json"))
-        markscheme_steps = _parse_markscheme_steps(raw_row.get("markscheme_steps_json"))
-        marks_available = _total_available_marks(markscheme_steps, parts)
-
-        # FT metadata: prefer questions table values, fall back to inference
-        ft_from_q_parts = q_row.get("ft_eligible_parts") or []
-        ft_from_q_deps = q_row.get("ft_dependencies") or {}
-
-        if ft_from_q_parts:
-            ft_eligible = [str(p) for p in ft_from_q_parts]
-            ft_deps = {str(k): str(v) for k, v in ft_from_q_deps.items()}
-        else:
-            ft_eligible, ft_deps = _infer_ft_fields(markscheme_steps)
-
-        questions.append(
-            ParsedQuestion(
-                question_uuid=str(q_row.get("id")),
-                source_id=source_id,
-                problem_text=str(raw_row.get("problem_text") or ""),
-                diagram_required=(raw_row.get("question_media_count") or 0) > 0
-                or bool(q_row.get("diagram_required")),
-                parts=parts,
-                markscheme_steps=markscheme_steps,
-                marks_available=marks_available,
-                ft_eligible_parts=ft_eligible,
-                ft_dependencies=ft_deps,
-                assignment_question_id=str(aq["id"]),
-            )
-        )
-
-    if not questions:
-        logger.error("[job] submission=%s: no resolvable questions", submission_id)
-        await asyncio.to_thread(_set_processing_error, "no_resolvable_questions")
-        return {"submission_id": submission_id, "error": "no_resolvable_questions"}
-
-    if is_question_scoped:
-        if len(questions) != 1 or questions[0].assignment_question_id != str(submission_aqid):
-            logger.error(
-                "[job] submission=%s: scoped assignment_question_id mismatch expected=%s got=%s",
-                submission_id,
-                submission_aqid,
-                [q.assignment_question_id for q in questions],
-            )
-            await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
-            return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
-
-    # ── 5. Grade each question ─────────────────────────────────────
-    graded_count = 0
-    error_count = 0
-    is_ib_style = grading_style == "ib_style"
-
-    for question in questions:
-        extracted_answers: dict[str, str | None] = {}
-
-        if is_ib_style:
-            llm_result = await _call_grading_llm(
-                system_prompt=system_prompt,
-                question=question,
-                ocr_text=full_ocr_text,
-                has_low_confidence_ocr=has_low_confidence_ocr,
-                extracted_answers=extracted_answers,
-                user_id=job_user_id,
-                submission_id=submission_id,
-            )
-        else:
-            simple_q = ParsedQuestion(
-                question_uuid=question.question_uuid,
-                source_id=question.source_id,
-                problem_text=question.problem_text,
-                diagram_required=question.diagram_required,
-                parts=question.parts,
-                markscheme_steps=question.markscheme_steps,
-                marks_available=question.marks_available,
-                ft_eligible_parts=[],
-                ft_dependencies={},
-                assignment_question_id=question.assignment_question_id,
-            )
-            llm_result = await _call_grading_llm(
-                system_prompt=system_prompt
-                + "\n\nThis assignment uses SIMPLE grading (correct/incorrect + explanation only). "
-                "Do not apply IB-style mark type distinctions or FT logic.",
-                question=simple_q,
-                ocr_text=full_ocr_text,
-                has_low_confidence_ocr=has_low_confidence_ocr,
-                extracted_answers=extracted_answers,
-                user_id=job_user_id,
-                submission_id=submission_id,
             )
 
-        # Populate extracted_answers from LLM result
-        if llm_result and isinstance(llm_result.get("parts"), list):
-            for part in llm_result["parts"]:
-                pl = part.get("part_label")
-                ea = part.get("extracted_answer")
-                if pl and ea:
-                    extracted_answers[pl] = ea
+            if is_question_scoped:
+                res = (
+                    q.eq("id", assignment_question_id)
+                    .eq("assignment_id", assignment.get("id"))
+                    .execute()
+                )
+            else:
+                res = (
+                    q.eq("assignment_id", assignment.get("id"))
+                    .order("position")
+                    .execute()
+                )
 
-        # Amber + trust layer
-        extra_amber, extra_amber_reason = _detect_amber(full_ocr_text, llm_result)
-        final_amber = extra_amber or bool(llm_result and llm_result.get("overall_amber_flag")) or has_low_confidence_ocr
-        final_amber_reason = (
-            extra_amber_reason
-            or (
-                "Low OCR confidence on one or more submission pages"
-                if has_low_confidence_ocr
-                else None
+            return res.data or []
+
+        aq_rows = await asyncio.to_thread(_fetch_aq_rows)
+        if not aq_rows:
+            if is_question_scoped:
+                logger.error(
+                    "[job] submission=%s: assignment_question_id=%s not found for assignment=%s",
+                    submission_id,
+                    assignment_question_id,
+                    assignment.get("id"),
+                )
+                await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+                return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
+
+            logger.error("[job] submission=%s: no assignment_questions rows", submission_id)
+            await asyncio.to_thread(_set_processing_error, "no_assignment_questions")
+            return {"submission_id": submission_id, "error": "no_assignment_questions"}
+
+        # 4e. Resolve IB question details for each assignment question
+        questions: list[ParsedQuestion] = []
+
+        for aq in aq_rows:
+            q_row = aq.get("questions") or {}
+            if isinstance(q_row, list):
+                q_row = q_row[0] if q_row else {}
+            if not q_row:
+                logger.warning("[job] no question row for aq.id=%s", aq.get("id"))
+                continue
+
+            source_table: str = q_row.get("source_table") or "ib_math_questionbank"
+            source_id: str = str(q_row.get("source_id") or "")
+            if not source_id:
+                logger.warning("[job] question %s has no source_id", q_row.get("id"))
+                continue
+
+            # ── 3c: Quiz questions dispatch ───────────────────────────
+            if source_table == "quiz_questions":
+                raw_quiz_row = await asyncio.to_thread(_fetch_quiz_question_row, source_id)
+                if not raw_quiz_row:
+                    logger.warning(
+                        "[job] quiz_question not found for source_id=%s", source_id
+                    )
+                    continue
+                question_json = raw_quiz_row.get("question_json") or {}
+                parsed = _parsed_question_from_quiz_json(
+                    qj=question_json,
+                    assignment_question_id=str(aq["id"]),
+                    question_uuid=str(q_row.get("id")),
+                    source_id=source_id,
+                )
+                questions.append(parsed)
+                continue
+
+            if source_table == "qb_generated":
+                raw_qb_row = await asyncio.to_thread(_fetch_qb_generated_row, source_id)
+                if not raw_qb_row:
+                    logger.warning(
+                        "[job] qb_generated row not found for source_id=%s", source_id
+                    )
+                    continue
+                parsed = _parsed_question_from_qb_generated_row(
+                    row=raw_qb_row,
+                    assignment_question_id=str(aq["id"]),
+                    question_uuid=str(q_row.get("id")),
+                    source_id=source_id,
+                    diagram_required=bool(q_row.get("diagram_required")),
+                )
+                questions.append(parsed)
+                continue
+
+            if source_table == "waec_math_questionbank":
+                raw_waec_row = await asyncio.to_thread(_fetch_waec_questionbank_row, source_id)
+                if not raw_waec_row:
+                    logger.warning(
+                        "[job] waec_math_questionbank row not found for source_id=%s", source_id
+                    )
+                    continue
+                parsed = _parsed_question_from_waec_row(
+                    row=raw_waec_row,
+                    assignment_question_id=str(aq["id"]),
+                    question_uuid=str(q_row.get("id")),
+                    source_id=source_id,
+                )
+                questions.append(parsed)
+                continue
+
+            def _fetch_ib_row(sid: str) -> dict | None:
+                _IB_TABLES = ("ib_math_questionbank", "ib_new_math")
+                if source_table not in _IB_TABLES:
+                    return None
+                res = (
+                    svc.table(source_table)
+                    .select(
+                        "id, domain, theme, theme_slug, level, difficulty, problem_text, "
+                        "question_media_count, parts_count, parts_json, "
+                        "markscheme_steps_count, markscheme_steps_json"
+                    )
+                    .eq("id", int(sid))
+                    .maybe_single()
+                    .execute()
+                )
+                return _msd(res)
+
+            raw_row = await asyncio.to_thread(_fetch_ib_row, source_id)
+            if not raw_row:
+                logger.warning(
+                    "[job] source row not found for source_id=%s table=%s", source_id, source_table
+                )
+                continue
+
+            parts = _parse_parts(raw_row.get("parts_json"))
+            markscheme_steps = _parse_markscheme_steps(raw_row.get("markscheme_steps_json"))
+            marks_available = _total_available_marks(markscheme_steps, parts)
+
+            # FT metadata: prefer questions table values, fall back to inference
+            ft_from_q_parts = q_row.get("ft_eligible_parts") or []
+            ft_from_q_deps = q_row.get("ft_dependencies") or {}
+
+            if ft_from_q_parts:
+                ft_eligible = [str(p) for p in ft_from_q_parts]
+                ft_deps = {str(k): str(v) for k, v in ft_from_q_deps.items()}
+            else:
+                ft_eligible, ft_deps = _infer_ft_fields(markscheme_steps)
+
+            questions.append(
+                ParsedQuestion(
+                    question_uuid=str(q_row.get("id")),
+                    source_id=source_id,
+                    problem_text=str(raw_row.get("problem_text") or ""),
+                    diagram_required=(raw_row.get("question_media_count") or 0) > 0
+                    or bool(q_row.get("diagram_required")),
+                    parts=parts,
+                    markscheme_steps=markscheme_steps,
+                    marks_available=marks_available,
+                    ft_eligible_parts=ft_eligible,
+                    ft_dependencies=ft_deps,
+                    assignment_question_id=str(aq["id"]),
+                )
             )
-            or (llm_result.get("overall_amber_reason") if llm_result else None)
-        )
 
-        marks_awarded = int(llm_result.get("total_marks_awarded") or 0) if llm_result else 0
-        marks_available_q = question.marks_available
-        confidence = float(llm_result.get("confidence") or 0) if llm_result else 0.0
-        feedback_text = str(llm_result.get("feedback_text") or "") if llm_result else ""
-        ft_applied = any(
-            p.get("ft_applied") for p in (llm_result.get("parts") or [])
-        ) if llm_result else False
+        if not questions:
+            logger.error("[job] submission=%s: no resolvable questions", submission_id)
+            await asyncio.to_thread(_set_processing_error, "no_resolvable_questions")
+            return {"submission_id": submission_id, "error": "no_resolvable_questions"}
 
-        llm_assessment = (
-            json.dumps({
-                "full_assessment": llm_result.get("full_assessment"),
-                "parts": llm_result.get("parts"),
-            })
-            if llm_result
-            else '{"error":"LLM call failed"}'
-        )
+        if is_question_scoped:
+            if len(questions) != 1 or questions[0].assignment_question_id != str(assignment_question_id):
+                logger.error(
+                    "[job] submission=%s: scoped assignment_question_id mismatch expected=%s got=%s",
+                    submission_id,
+                    assignment_question_id,
+                    [q.assignment_question_id for q in questions],
+                )
+                await asyncio.to_thread(_set_processing_error, "assignment_question_id mismatch")
+                return {"submission_id": submission_id, "error": "assignment_question_id mismatch"}
 
-        trust_layer = _classify_trust_layer(final_amber, marks_awarded, marks_available_q)
+        # ── 5. Grade each question ─────────────────────────────────────
+        graded_count = 0
+        error_count = 0
+        is_ib_style = grading_style == "ib_style"
 
-        def _upsert_result(aq_id: str) -> bool:
-            try:
-                svc.table("grading_results").upsert(
-                    {
-                        "submission_id": submission_id,
-                        "assignment_question_id": aq_id,
+        await asyncio.to_thread(_set_mock_phase, "grading")
+        for question in questions:
+            extracted_answers: dict[str, str | None] = {}
+
+            if is_ib_style:
+                llm_result = await _call_grading_llm(
+                    system_prompt=system_prompt,
+                    question=question,
+                    ocr_text=full_ocr_text,
+                    has_low_confidence_ocr=has_low_confidence_ocr,
+                    extracted_answers=extracted_answers,
+                    user_id=job_user_id,
+                    submission_id=submission_id,
+                )
+            else:
+                simple_q = ParsedQuestion(
+                    question_uuid=question.question_uuid,
+                    source_id=question.source_id,
+                    problem_text=question.problem_text,
+                    diagram_required=question.diagram_required,
+                    parts=question.parts,
+                    markscheme_steps=question.markscheme_steps,
+                    marks_available=question.marks_available,
+                    ft_eligible_parts=[],
+                    ft_dependencies={},
+                    assignment_question_id=question.assignment_question_id,
+                )
+                llm_result = await _call_grading_llm(
+                    system_prompt=system_prompt
+                    + "\n\nThis assignment uses SIMPLE grading (correct/incorrect + explanation only). "
+                    "Do not apply IB-style mark type distinctions or FT logic.",
+                    question=simple_q,
+                    ocr_text=full_ocr_text,
+                    has_low_confidence_ocr=has_low_confidence_ocr,
+                    extracted_answers=extracted_answers,
+                    user_id=job_user_id,
+                    submission_id=submission_id,
+                )
+
+            _normalize_llm_part_labels(llm_result, question)
+
+            # Populate extracted_answers from LLM result
+            if llm_result and isinstance(llm_result.get("parts"), list):
+                for part in llm_result["parts"]:
+                    pl = part.get("part_label")
+                    ea = part.get("extracted_answer")
+                    if pl and ea:
+                        extracted_answers[pl] = ea
+
+            # Amber + trust layer
+            extra_amber, extra_amber_reason = _detect_amber(full_ocr_text, llm_result)
+            final_amber = extra_amber or bool(llm_result and llm_result.get("overall_amber_flag")) or has_low_confidence_ocr
+            final_amber_reason = (
+                extra_amber_reason
+                or (
+                    "Low OCR confidence on one or more submission pages"
+                    if has_low_confidence_ocr
+                    else None
+                )
+                or (llm_result.get("overall_amber_reason") if llm_result else None)
+            )
+
+            marks_awarded = _safe_int(llm_result.get("total_marks_awarded") or 0) if llm_result else 0
+            marks_available_q = question.marks_available
+            marks_awarded = max(0, min(marks_awarded, marks_available_q))
+            confidence = _safe_float(llm_result.get("confidence") or 0) if llm_result else 0.0
+            feedback_text = str(llm_result.get("feedback_text") or "") if llm_result else ""
+            ft_applied = any(
+                p.get("ft_applied") for p in (llm_result.get("parts") or [])
+            ) if llm_result else False
+
+            if llm_result:
+                _fa = llm_result.get("full_assessment")
+                _parts = llm_result.get("parts")
+                llm_assessment = json.dumps({
+                    "full_assessment": _fa if isinstance(_fa, str) else None,
+                    "parts": _parts if isinstance(_parts, list) else [],
+                })
+            else:
+                llm_assessment = '{"error":"LLM call failed"}'
+
+            trust_layer = _classify_trust_layer(final_amber, marks_awarded, marks_available_q)
+
+            def _upsert_result(aq_id: str) -> bool:
+                try:
+                    ai_payload: dict = {
                         "prompt_version_id": prompt_version_id,
                         "ocr_text": full_ocr_text,
                         "llm_assessment": llm_assessment,
                         "marks_awarded": marks_awarded,
                         "marks_available": marks_available_q,
                         "method_marks_awarded": (
-                            llm_result.get("total_method_marks") if llm_result else None
-                        ),
+                            None if (v := llm_result.get("total_method_marks")) is None
+                            else _safe_int(v)
+                        ) if llm_result else None,
                         "accuracy_marks_awarded": (
-                            llm_result.get("total_accuracy_marks") if llm_result else None
-                        ),
+                            None if (v := llm_result.get("total_accuracy_marks")) is None
+                            else _safe_int(v)
+                        ) if llm_result else None,
                         "ft_marks_awarded": (
-                            llm_result.get("total_ft_marks") if llm_result else None
-                        ),
+                            None if (v := llm_result.get("total_ft_marks")) is None
+                            else _safe_int(v)
+                        ) if llm_result else None,
                         "ft_applied": ft_applied,
                         "feedback_text": feedback_text,
                         "confidence_score": confidence,
@@ -1442,59 +1696,95 @@ async def process_submission(
                         "amber_flag": final_amber,
                         "amber_reason": final_amber_reason,
                         "diagram_flag": question.diagram_required,
-                        "teacher_overridden": False,
-                        "student_flagged": False,
-                    },
-                    on_conflict="submission_id,assignment_question_id",
-                ).execute()
-                return True
-            except Exception as exc:
-                logger.error("[job] grading_results upsert failed aq=%s: %s", aq_id, exc)
-                return False
+                    }
+                    existing = _msd(
+                        svc.table("grading_results")
+                        .select("id")
+                        .eq("submission_id", submission_id)
+                        .eq("assignment_question_id", aq_id)
+                        .maybe_single()
+                        .execute()
+                    )
+                    if existing:
+                        # Re-grade: refresh AI fields only; never touch teacher_overridden,
+                        # student_flagged, teacher_override_*, or dispute columns so that
+                        # approved grades and pending disputes survive a re-run.
+                        svc.table("grading_results").update(ai_payload).eq(
+                            "id", existing["id"]
+                        ).execute()
+                    else:
+                        svc.table("grading_results").insert(
+                            {
+                                "submission_id": submission_id,
+                                "assignment_question_id": aq_id,
+                                **ai_payload,
+                                "teacher_overridden": False,
+                                "student_flagged": False,
+                            }
+                        ).execute()
+                    return True
+                except Exception as exc:
+                    logger.error("[job] grading_results upsert failed aq=%s: %s", aq_id, exc)
+                    return False
 
-        ok = await asyncio.to_thread(_upsert_result, question.assignment_question_id)
-        if ok:
-            graded_count += 1
-            logger.info(
-                "[job] graded aq=%s marks=%d/%d amber=%s trust=%s",
-                question.assignment_question_id,
-                marks_awarded,
-                marks_available_q,
-                final_amber,
-                trust_layer,
+            ok = await asyncio.to_thread(_upsert_result, question.assignment_question_id)
+            if ok:
+                graded_count += 1
+                logger.info(
+                    "[job] graded aq=%s marks=%d/%d amber=%s trust=%s",
+                    question.assignment_question_id,
+                    marks_awarded,
+                    marks_available_q,
+                    final_amber,
+                    trust_layer,
+                )
+            else:
+                error_count += 1
+
+        # ── 6. Advance status to 'graded' ─────────────────────────────
+        if error_count > 0:
+            logger.error(
+                "[job] submission=%s: %d grading_results upsert(s) failed — status stays 'ocr_done'",
+                submission_id, error_count,
             )
-        else:
-            error_count += 1
+            await asyncio.to_thread(_set_processing_error, "db_write_error")
+        elif graded_count > 0:
+            def _advance_to_graded() -> None:
+                svc.table("submissions").update({
+                    "status": "graded",
+                    "graded_at": datetime.now(timezone.utc).isoformat(),
+                    "mock_phase": "done",
+                }).eq("id", submission_id).eq("status", "ocr_done").execute()
 
-    # ── 6. Advance status to 'graded' ─────────────────────────────
-    if error_count > 0:
-        logger.error(
-            "[job] submission=%s: %d grading_results upsert(s) failed — status stays 'ocr_done'",
-            submission_id, error_count,
+            await asyncio.to_thread(_advance_to_graded)
+
+        logger.info(
+            "[job] complete submission=%s graded=%d/%d errors=%d prompt=%s",
+            submission_id,
+            graded_count,
+            len(questions),
+            error_count,
+            prompt_row.get("version_tag"),
         )
-        await asyncio.to_thread(_set_processing_error, "db_write_error")
-    elif graded_count > 0:
-        def _advance_to_graded() -> None:
-            svc.table("submissions").update({
-                "status": "graded",
-                "graded_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("id", submission_id).eq("status", "ocr_done").execute()
 
-        await asyncio.to_thread(_advance_to_graded)
-
-    logger.info(
-        "[job] complete submission=%s graded=%d/%d errors=%d prompt=%s",
-        submission_id,
-        graded_count,
-        len(questions),
-        error_count,
-        prompt_row.get("version_tag"),
-    )
-
-    return {
-        "submission_id": submission_id,
-        "questions_graded": graded_count,
-        "questions_total": len(questions),
-        "errors": error_count,
-        "prompt_version": prompt_row.get("version_tag"),
-    }
+        return {
+            "submission_id": submission_id,
+            "questions_graded": graded_count,
+            "questions_total": len(questions),
+            "errors": error_count,
+            "prompt_version": prompt_row.get("version_tag"),
+        }
+    except asyncio.CancelledError:
+        # asyncio.CancelledError is a BaseException — the except Exception block
+        # below never fires when ARQ cancels a job via job_timeout or worker
+        # shutdown.  Call _set_processing_error directly (no await) so the DB
+        # write cannot itself be cancelled before it completes, then re-raise so
+        # ARQ marks the job as failed.
+        _set_processing_error("job_timeout")
+        raise
+    except Exception:
+        await asyncio.to_thread(_set_processing_error, "internal_error")
+        raise
+    finally:
+        if _lock_acquired and _redis is not None:
+            await _redis.delete(_lock_key)

@@ -43,7 +43,8 @@ class WorkerSettings:
     # Keep job results in Redis for 1 hour (useful for debugging)
     keep_result = 3600
 
-    # Retry failed jobs (not including jobs that raised — those need explicit retry)
+    # ARQ only auto-retries jobs that raise arq.Retry; jobs that raise any other
+    # exception (including CancelledError from job_timeout) are NOT retried.
     max_tries = 3
 
     @staticmethod

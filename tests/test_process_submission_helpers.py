@@ -14,11 +14,17 @@ from gradenza_api.jobs.process_submission import (
     PHOTO_FETCH_ATTEMPTS,
     ParsedMarkschemeStep,
     ParsedPart,
+    ParsedQuestion,
+    _call_grading_llm,
     _clamp01,
     _classify_trust_layer,
     _detect_amber,
     _fetch_photos_retrying,
     _mime_for_path,
+    _normalize_llm_part_labels,
+    _run_ocr,
+    _safe_float,
+    _safe_int,
     _total_available_marks,
     process_submission,
 )
@@ -118,6 +124,26 @@ def test_total_marks_fallback_to_parts():
     assert _total_available_marks(steps, parts) == 5
 
 
+def test_normalize_llm_part_labels_replaces_null_label():
+    question = ParsedQuestion(
+        question_uuid="q-1",
+        source_id="src-1",
+        problem_text="Question",
+        diagram_required=False,
+        parts=[],
+        markscheme_steps=[],
+        marks_available=1,
+        ft_eligible_parts=[],
+        ft_dependencies={},
+        assignment_question_id="aq-1",
+    )
+    llm_result = {"parts": [{"part_label": None, "marks_awarded": 1}]}
+
+    _normalize_llm_part_labels(llm_result, question)
+
+    assert llm_result["parts"][0]["part_label"] == "a"
+
+
 # ── _fetch_photos_retrying ────────────────────────────────────────────────────
 
 async def test_fetch_photos_retrying_returns_on_first_non_empty():
@@ -215,15 +241,14 @@ def _make_svc(
 
 
 def _assert_error_writes(mock_subs_tbl: MagicMock, expected_code: str) -> None:
-    """Assert the two expected submissions.update() calls: clear then set."""
-    calls = mock_subs_tbl.update.call_args_list
-    assert len(calls) == 2, f"expected 2 update calls, got {len(calls)}: {calls}"
-    # First call clears any previous error
-    assert calls[0].args[0] == {"processing_error": None, "processing_error_at": None}
-    # Second call records the new error
-    payload = calls[1].args[0]
-    assert payload["processing_error"] == expected_code
-    assert payload["processing_error_at"] is not None
+    """Assert the expected submissions.update() calls: a clear then an error set."""
+    payloads = [c.args[0] for c in mock_subs_tbl.update.call_args_list if c.args]
+    clear_calls = [p for p in payloads if p.get("processing_error") is None and "processing_error_at" in p]
+    assert len(clear_calls) >= 1, f"expected a clear_processing_error call; got: {payloads}"
+    error_calls = [p for p in payloads if p.get("processing_error") == expected_code]
+    assert len(error_calls) == 1, f"expected one error call with code={expected_code!r}; got: {payloads}"
+    assert error_calls[0].get("mock_phase") == "error", f"expected mock_phase='error' in error payload; got: {error_calls[0]}"
+    assert error_calls[0]["processing_error_at"] is not None
 
 
 async def test_process_submission_no_photos_writes_error_and_exits():
@@ -278,6 +303,91 @@ async def test_process_submission_storage_download_error_writes_error_and_exits(
     mock_llm.assert_not_called()
     mock_subs_tbl.upsert.assert_not_called()
     assert all(c.args[0] != "grading_results" for c in mock_svc.table.call_args_list)
+
+
+# ── H2: OCR service failure must not write ocr_done_at ───────────────────────
+
+async def test_ocr_service_failure_sets_error_without_marking_photo_done():
+    """When OpenRouter raises during OCR, processing_error='ocr_service_error' is set
+    and ocr_done_at is NOT written — so the photo can be retried on the next run."""
+    photo_row = {
+        "id": "ph-1",
+        "submission_id": "sub-ocr-fail",
+        "page_number": 1,
+        "storage_path": "student/sub-ocr-fail/attempt_1/001.jpg",
+        "ocr_done_at": None,
+    }
+    mock_svc, mock_photos_tbl, mock_subs_tbl = _make_svc(
+        photos_data=[photo_row],
+        submission_row={
+            "id": "sub-ocr-fail",
+            "status": "submitted",
+            "assignment_id": "assign-1",
+            "assignment_question_id": None,
+        },
+    )
+    mock_svc.storage.from_.return_value.download.return_value = b"fake_image_bytes"
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=mock_svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "gradenza_api.jobs.process_submission.call_openrouter",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("OpenRouter 503"),
+        ),
+        patch("gradenza_api.jobs.process_submission.record_ai_usage", new_callable=AsyncMock),
+    ):
+        result = await process_submission({}, submission_id="sub-ocr-fail", force=False)
+
+    assert result == {"submission_id": "sub-ocr-fail", "error": "ocr_service_error"}
+    _assert_error_writes(mock_subs_tbl, "ocr_service_error")
+
+    # submission_photos.update() must NOT have been called with ocr_done_at
+    for c in mock_photos_tbl.update.call_args_list:
+        payload = c.args[0] if c.args else {}
+        assert "ocr_done_at" not in payload, (
+            f"ocr_done_at must NOT be written on OCR failure; got: {payload}"
+        )
+
+
+async def test_ocr_service_failure_then_healthy_retry_succeeds():
+    """After an OCR transient failure (ocr_done_at stays NULL), a healthy retry
+    runs OCR again and advances to graded."""
+    photo_row = {
+        "id": "ph-1",
+        "submission_id": "sub-ocr-retry",
+        "page_number": 1,
+        "storage_path": "student/sub-ocr-retry/attempt_1/001.jpg",
+        "ocr_done_at": None,
+    }
+    mock_svc, mock_photos_tbl, mock_subs_tbl = _make_svc(
+        photos_data=[photo_row],
+        submission_row={
+            "id": "sub-ocr-retry",
+            "status": "submitted",
+            "assignment_id": "assign-1",
+            "assignment_question_id": None,
+        },
+    )
+    mock_svc.storage.from_.return_value.download.return_value = b"fake_image_bytes"
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=mock_svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "gradenza_api.jobs.process_submission.call_openrouter",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("OpenRouter 503"),
+        ),
+        patch("gradenza_api.jobs.process_submission.record_ai_usage", new_callable=AsyncMock),
+    ):
+        first_result = await process_submission({}, submission_id="sub-ocr-retry", force=False)
+
+    assert first_result["error"] == "ocr_service_error"
+    # ocr_done_at was not written, so the photo is still retryable
+    for c in mock_photos_tbl.update.call_args_list:
+        assert "ocr_done_at" not in (c.args[0] if c.args else {})
 
 
 # ── Integration: grading_results upsert ──────────────────────────────────────
@@ -389,9 +499,33 @@ _LLM_RESPONSE = json.dumps({
     "parts": [{"part_label": "a", "extracted_answer": "x=2", "ft_applied": False}],
 })
 
+_LLM_RESPONSE_NULL_PART_LABEL = json.dumps({
+    "total_marks_awarded": 3,
+    "total_method_marks": 2,
+    "total_accuracy_marks": 1,
+    "total_ft_marks": 0,
+    "confidence": 0.85,
+    "feedback_text": "Good attempt.",
+    "overall_amber_flag": False,
+    "overall_amber_reason": None,
+    "full_assessment": "Student found x=2.",
+    "parts": [{"part_label": None, "extracted_answer": "x=2", "ft_applied": False}],
+})
+
+
+def _openrouter_result(content: str) -> MagicMock:
+    result = MagicMock()
+    result.content = content
+    result.usage.prompt_tokens = 10
+    result.usage.completion_tokens = 5
+    result.usage.total_tokens = 15
+    result.usage.model = "test-model"
+    result.usage.request_id = "req-test"
+    return result
+
 
 def _make_grading_svc(
-    upsert_raises: bool = False,
+    insert_raises: bool = False,
     *,
     aq_row: dict | None = None,
     ib_row: dict | None = None,
@@ -438,9 +572,11 @@ def _make_grading_svc(
     # qb_generated
     qb_tbl.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = qb_generated_row
 
-    # grading_results upsert — succeed or raise based on flag
-    if upsert_raises:
-        gr_tbl.upsert.return_value.execute.side_effect = Exception("db error")
+    # grading_results: no existing row (maybe_single returns None) → insert path
+    gr_tbl.select.return_value.eq.return_value.eq.return_value.maybe_single.return_value.execute.return_value = None
+
+    if insert_raises:
+        gr_tbl.insert.return_value.execute.side_effect = Exception("db error")
 
     table_map = {
         "submission_photos": photos_tbl,
@@ -457,8 +593,8 @@ def _make_grading_svc(
     return svc, subs_tbl, gr_tbl
 
 
-async def test_grading_results_upsert_called_with_keyword_on_conflict():
-    """upsert() must use on_conflict as a keyword arg (not a positional dict)."""
+async def test_grading_results_insert_called_for_new_row():
+    """First grading of a question must insert a new grading_results row."""
     svc, _, gr_tbl = _make_grading_svc()
 
     with (
@@ -467,19 +603,36 @@ async def test_grading_results_upsert_called_with_keyword_on_conflict():
         patch(
             "gradenza_api.jobs.process_submission.call_openrouter",
             new_callable=AsyncMock,
-            return_value=_LLM_RESPONSE,
+            return_value=_openrouter_result(_LLM_RESPONSE),
         ),
     ):
         await process_submission({}, submission_id="sub-grade", force=False)
 
-    gr_tbl.upsert.assert_called_once()
-    pos_args = gr_tbl.upsert.call_args.args
-    kwargs = gr_tbl.upsert.call_args.kwargs
-    assert len(pos_args) == 1, f"upsert() should receive exactly 1 positional arg, got {len(pos_args)}"
-    assert kwargs.get("on_conflict") == "submission_id,assignment_question_id"
-    payload = pos_args[0]
+    gr_tbl.insert.assert_called_once()
+    gr_tbl.update.assert_not_called()
+    payload = gr_tbl.insert.call_args.args[0]
     assert payload["submission_id"] == "sub-grade"
     assert payload["assignment_question_id"] == "aq-1"
+    assert payload["teacher_overridden"] is False
+
+
+async def test_grading_results_upsert_normalizes_null_llm_part_label():
+    svc, _, gr_tbl = _make_grading_svc()
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "gradenza_api.jobs.process_submission.call_openrouter",
+            new_callable=AsyncMock,
+            return_value=_openrouter_result(_LLM_RESPONSE_NULL_PART_LABEL),
+        ),
+    ):
+        await process_submission({}, submission_id="sub-grade", force=False)
+
+    payload = gr_tbl.insert.call_args.args[0]
+    assessment = json.loads(payload["llm_assessment"])
+    assert assessment["parts"][0]["part_label"] == "a"
 
 
 async def test_process_submission_resolves_qb_generated_questions():
@@ -495,7 +648,7 @@ async def test_process_submission_resolves_qb_generated_questions():
         patch(
             "gradenza_api.jobs.process_submission.call_openrouter",
             new_callable=AsyncMock,
-            return_value=_LLM_RESPONSE,
+            return_value=_openrouter_result(_LLM_RESPONSE),
         ) as mock_llm,
     ):
         result = await process_submission({}, submission_id="sub-grade", force=False)
@@ -503,7 +656,7 @@ async def test_process_submission_resolves_qb_generated_questions():
     assert result["questions_graded"] == 1
     assert result["errors"] == 0
     assert mock_llm.await_count == 1
-    payload = gr_tbl.upsert.call_args.args[0]
+    payload = gr_tbl.insert.call_args.args[0]
     assert payload["assignment_question_id"] == "aq-1"
     assert payload["marks_available"] == 3
 
@@ -561,17 +714,23 @@ async def test_grading_results_upsert_success_clears_error_and_advances_to_grade
     assert result["errors"] == 0
 
     update_calls = subs_tbl.update.call_args_list
-    assert len(update_calls) == 3, f"expected 3 submissions.update calls, got {len(update_calls)}"
+    assert len(update_calls) == 5, f"expected 5 submissions.update calls, got {len(update_calls)}"
     assert update_calls[0].args[0] == {"processing_error": None, "processing_error_at": None}
-    assert update_calls[1].args[0] == {"status": "ocr_done"}
-    graded_payload = update_calls[2].args[0]
+    assert update_calls[1].args[0] == {"mock_phase": "ocr"}
+    assert update_calls[2].args[0] == {"status": "ocr_done", "mock_phase": "extracting"}
+    assert update_calls[3].args[0] == {"mock_phase": "grading"}
+    graded_payload = update_calls[4].args[0]
     assert graded_payload["status"] == "graded"
+    assert graded_payload["mock_phase"] == "done"
     assert "processing_error" not in graded_payload
 
 
-async def test_grading_results_upsert_failure_sets_db_write_error():
-    """When upsert raises, processing_error='db_write_error' and status stays 'ocr_done'."""
-    svc, subs_tbl, gr_tbl = _make_grading_svc(upsert_raises=True)
+async def test_grading_results_first_grade_does_not_crash_when_no_existing_row():
+    """maybe_single().execute() returns None for new rows; _msd() must guard this so
+    the insert path runs instead of raising AttributeError on .data."""
+    svc, _, gr_tbl = _make_grading_svc()
+    # Explicit: select returns None (the postgrest behaviour for an empty maybe_single)
+    gr_tbl.select.return_value.eq.return_value.eq.return_value.maybe_single.return_value.execute.return_value = None
 
     with (
         patch("gradenza_api.jobs.process_submission.get_service_client", return_value=svc),
@@ -579,7 +738,28 @@ async def test_grading_results_upsert_failure_sets_db_write_error():
         patch(
             "gradenza_api.jobs.process_submission.call_openrouter",
             new_callable=AsyncMock,
-            return_value=_LLM_RESPONSE,
+            return_value=_openrouter_result(_LLM_RESPONSE),
+        ),
+    ):
+        result = await process_submission({}, submission_id="sub-grade", force=False)
+
+    assert result["questions_graded"] == 1, "insert should succeed, not crash with AttributeError"
+    assert result["errors"] == 0
+    gr_tbl.insert.assert_called_once()
+    gr_tbl.update.assert_not_called()
+
+
+async def test_grading_results_upsert_failure_sets_db_write_error():
+    """When the grading_results insert raises, processing_error='db_write_error' and status stays 'ocr_done'."""
+    svc, subs_tbl, gr_tbl = _make_grading_svc(insert_raises=True)
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "gradenza_api.jobs.process_submission.call_openrouter",
+            new_callable=AsyncMock,
+            return_value=_openrouter_result(_LLM_RESPONSE),
         ),
     ):
         result = await process_submission({}, submission_id="sub-grade", force=False)
@@ -588,12 +768,15 @@ async def test_grading_results_upsert_failure_sets_db_write_error():
     assert result["questions_graded"] == 0
 
     update_calls = subs_tbl.update.call_args_list
-    assert len(update_calls) == 3, f"expected 3 submissions.update calls, got {len(update_calls)}"
+    assert len(update_calls) == 5, f"expected 5 submissions.update calls, got {len(update_calls)}"
     assert update_calls[0].args[0] == {"processing_error": None, "processing_error_at": None}
-    assert update_calls[1].args[0] == {"status": "ocr_done"}
-    error_payload = update_calls[2].args[0]
+    assert update_calls[1].args[0] == {"mock_phase": "ocr"}
+    assert update_calls[2].args[0] == {"status": "ocr_done", "mock_phase": "extracting"}
+    assert update_calls[3].args[0] == {"mock_phase": "grading"}
+    error_payload = update_calls[4].args[0]
     assert error_payload["processing_error"] == "db_write_error"
     assert error_payload["processing_error_at"] is not None
+    assert error_payload.get("mock_phase") == "error"
     assert not any(c.args[0].get("status") == "graded" for c in update_calls)
 
 
@@ -726,6 +909,9 @@ def _make_question_scoped_grading_svc():
 
     ib_tbl.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = _IB_ROW
 
+    # grading_results: no existing row (maybe_single returns None) → insert path
+    gr_tbl.select.return_value.eq.return_value.eq.return_value.maybe_single.return_value.execute.return_value = None
+
     table_map = {
         "submission_photos": photos_tbl,
         "submissions": subs_tbl,
@@ -750,7 +936,7 @@ async def test_question_scoped_submission_grades_only_one_aqid():
         patch(
             "gradenza_api.jobs.process_submission.call_openrouter",
             new_callable=AsyncMock,
-            return_value=_LLM_RESPONSE,
+            return_value=_openrouter_result(_LLM_RESPONSE),
         ) as mock_llm,
     ):
         result = await process_submission(
@@ -764,8 +950,302 @@ async def test_question_scoped_submission_grades_only_one_aqid():
     assert result["questions_graded"] == 1
     assert result["errors"] == 0
     assert mock_llm.await_count == 1
-    assert gr_tbl.upsert.call_count == 1
+    assert gr_tbl.insert.call_count == 1
 
     # Ensure scoped AQID query path was used
     aq_calls = aq_tbl.select.return_value.eq.call_args_list
     assert any(c.args == ("id", "aq-1") for c in aq_calls)
+
+
+# ── C2: top-level exception handler writes internal_error ─────────────────────
+
+@pytest.mark.asyncio
+async def test_uncaught_exception_writes_internal_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Uncaught exceptions in process_submission must write processing_error='internal_error'.
+
+    Regression for C2: previously any exception after _clear_processing_error
+    left the submission silently stuck with no error code.
+    """
+    svc = MagicMock()
+    written_errors: list[str] = []
+
+    def _fake_update(payload):
+        code = payload.get("processing_error")
+        if code is not None:
+            written_errors.append(code)
+        mock_chain = MagicMock()
+        mock_chain.eq.return_value.execute.return_value = MagicMock(data=[])
+        return mock_chain
+
+    svc.table.return_value.update.side_effect = _fake_update
+    # _clear_processing_error path: update({"processing_error": None, ...})
+    # _set_processing_error path: update({"processing_error": <code>, ...})
+
+    # Monkeypatch _fetch_submission_scope to blow up — simulating any unexpected crash
+    # inside the try body after clear_processing_error runs.
+    import gradenza_api.jobs.process_submission as ps_mod
+
+    def _exploding_fetch() -> None:
+        raise RuntimeError("simulated internal crash")
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=svc),
+    ):
+        # Patch asyncio.to_thread so sync helpers run inline, then make the
+        # first real work function (_fetch_submission_scope) raise.
+        original_to_thread = ps_mod.asyncio.to_thread
+
+        async def _patched_to_thread(func, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if getattr(func, "__name__", "") == "_fetch_submission_scope":
+                raise RuntimeError("simulated internal crash")
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(ps_mod.asyncio, "to_thread", _patched_to_thread)
+
+        with pytest.raises(RuntimeError, match="simulated internal crash"):
+            await process_submission({}, submission_id="sub-crash")
+
+    assert "internal_error" in written_errors, (
+        f"expected 'internal_error' in processing_error writes, got: {written_errors}"
+    )
+
+
+# ── H1: LLM JSON shape validation ─────────────────────────────────────────────
+#
+# Regression for the three failure modes identified in H1:
+#   1. _run_ocr returns non-object JSON (list/string) → AttributeError on .get()
+#   2. _call_grading_llm returns non-object JSON     → AttributeError on .get()
+#   3. Numeric fields in LLM result are strings      → ValueError on int()/float()
+
+def test_safe_int_coerces_valid():
+    assert _safe_int(3) == 3
+    assert _safe_int("5") == 5
+
+def test_safe_int_returns_default_on_bad_value():
+    assert _safe_int("2/5") == 0
+    assert _safe_int("three") == 0
+    assert _safe_int(None) == 0
+    assert _safe_int("2/5", default=99) == 99
+
+def test_safe_float_coerces_valid():
+    assert _safe_float(0.9) == 0.9
+    assert _safe_float("0.85") == pytest.approx(0.85)
+
+def test_safe_float_returns_default_on_bad_value():
+    assert _safe_float("high") == 0.0
+    assert _safe_float("n/a") == 0.0
+    assert _safe_float(None) == 0.0
+    assert _safe_float("high", default=1.0) == 1.0
+
+
+@pytest.mark.asyncio
+async def test_run_ocr_non_object_json_falls_back_gracefully():
+    """_run_ocr receiving valid-JSON non-object (string/list/number) must not raise
+    AttributeError; it must fall back to returning the raw text with confidence 0.5."""
+    for bad_content in ['"just text"', '[1, 2]', '42']:
+        mock_result = _openrouter_result(bad_content)
+        with (
+            patch(
+                "gradenza_api.jobs.process_submission.call_openrouter",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("gradenza_api.jobs.process_submission.get_service_client", return_value=MagicMock()),
+            patch("gradenza_api.jobs.process_submission.record_ai_usage", new_callable=AsyncMock),
+        ):
+            text, conf = await _run_ocr("b64data", "image/jpeg", user_id="u-1", submission_id="sub-1")
+
+        assert isinstance(text, str), f"expected str for {bad_content!r}, got {type(text)}"
+        assert conf == 0.5, f"expected conf=0.5 fallback for {bad_content!r}, got {conf}"
+
+
+@pytest.mark.asyncio
+async def test_call_grading_llm_non_object_json_returns_none():
+    """_call_grading_llm receiving valid-JSON non-object must return None, not raise
+    AttributeError on subsequent .get() calls."""
+    question = ParsedQuestion(
+        question_uuid="q-1",
+        source_id="1",
+        problem_text="Test",
+        diagram_required=False,
+        parts=[],
+        markscheme_steps=[],
+        marks_available=5,
+        ft_eligible_parts=[],
+        ft_dependencies={},
+        assignment_question_id="aq-1",
+    )
+    for bad_content in ['"just text"', '[1, 2, 3]']:
+        mock_result = _openrouter_result(bad_content)
+        with (
+            patch(
+                "gradenza_api.jobs.process_submission.call_openrouter",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("gradenza_api.jobs.process_submission.get_service_client", return_value=MagicMock()),
+            patch("gradenza_api.jobs.process_submission.record_ai_usage", new_callable=AsyncMock),
+        ):
+            result = await _call_grading_llm(
+                system_prompt="Grade.",
+                question=question,
+                ocr_text="student answer",
+                has_low_confidence_ocr=False,
+                extracted_answers={},
+                user_id="u-1",
+                submission_id="sub-1",
+            )
+
+        assert result is None, f"expected None for non-object JSON {bad_content!r}, got {result!r}"
+
+
+def test_detect_amber_non_numeric_confidence_flags_amber():
+    """Non-numeric confidence string in LLM result must flag amber, not raise ValueError."""
+    amber, reason = _detect_amber("clean text", {"confidence": "high"})
+    assert amber is True
+
+
+_LLM_RESPONSE_FRACTIONAL_MARKS = json.dumps({
+    "total_marks_awarded": "2/5",
+    "total_method_marks": "three",
+    "total_accuracy_marks": None,
+    "total_ft_marks": 0,
+    "confidence": "medium",
+    "feedback_text": "Partial.",
+    "overall_amber_flag": False,
+    "overall_amber_reason": None,
+    "full_assessment": "Attempted.",
+    "parts": [{"part_label": "a", "extracted_answer": "x=?", "ft_applied": False}],
+})
+
+
+@pytest.mark.asyncio
+async def test_lock_contention_defers_requeue_instead_of_dropping():
+    """Lock contention must re-enqueue with a deferral, not silently drop the job.
+
+    Regression: before the fix, job B would return {"skipped": "concurrent_job"}
+    terminally when job A held the lock, leaving processing_error persisted with
+    no active job to recover.
+    """
+    mock_redis = AsyncMock()
+    mock_redis.set.return_value = False  # simulate lock held by another job
+    mock_redis.enqueue_job = AsyncMock()
+
+    result = await process_submission(
+        {"redis": mock_redis},
+        submission_id="sub-lock",
+        assignment_question_id="aq-1",
+        has_assignment_question_id=True,
+        force=False,
+        retry_count=0,
+    )
+
+    assert result["skipped"] == "concurrent_job"
+    assert result["deferred"] is True
+    assert result["retry_count"] == 1
+
+    mock_redis.enqueue_job.assert_called_once()
+    call_kwargs = mock_redis.enqueue_job.call_args.kwargs
+    assert "_defer_by" in call_kwargs, "re-enqueue must use _defer_by to avoid instant re-collision"
+    # Positional args: function_name, submission_id, aqid, has_aqid, force, retry_count
+    call_args = mock_redis.enqueue_job.call_args.args
+    assert call_args[0] == "process_submission"
+    assert call_args[1] == "sub-lock"
+    assert call_args[5] == 1  # retry_count incremented
+
+
+@pytest.mark.asyncio
+async def test_lock_contention_gives_up_after_max_retries():
+    """After max retries exhausted, lock contention must NOT re-enqueue (avoids infinite loop)."""
+    mock_redis = AsyncMock()
+    mock_redis.set.return_value = False
+    mock_redis.enqueue_job = AsyncMock()
+
+    result = await process_submission(
+        {"redis": mock_redis},
+        submission_id="sub-lock",
+        retry_count=5,  # already at max
+    )
+
+    assert result["skipped"] == "concurrent_job"
+    assert result["deferred"] is False
+    mock_redis.enqueue_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_grading_malformed_numeric_fields_completes_without_exception():
+    """LLM returning non-numeric marks/confidence strings must not crash the job.
+    The job must complete with marks_awarded=0 (coercion default) via amber/layer3 result."""
+    svc, _, gr_tbl = _make_grading_svc()
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "gradenza_api.jobs.process_submission.call_openrouter",
+            new_callable=AsyncMock,
+            return_value=_openrouter_result(_LLM_RESPONSE_FRACTIONAL_MARKS),
+        ),
+    ):
+        result = await process_submission({}, submission_id="sub-grade", force=False)
+
+    assert result["questions_graded"] == 1
+    assert result["errors"] == 0
+    payload = gr_tbl.insert.call_args.args[0]
+    assert payload["marks_awarded"] == 0  # "2/5" coerces to 0, not a crash
+
+
+# ── mock_phase progression ────────────────────────────────────────────────────
+
+async def test_mock_phase_sequence_on_success():
+    """mock_phase advances: ocr → extracting (embedded in ocr_done) → grading → done."""
+    svc, subs_tbl, _ = _make_grading_svc()
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "gradenza_api.jobs.process_submission.call_openrouter",
+            new_callable=AsyncMock,
+            return_value=_openrouter_result(_LLM_RESPONSE),
+        ),
+    ):
+        result = await process_submission({}, submission_id="sub-grade", force=False)
+
+    assert result["questions_graded"] == 1
+    phase_writes = [
+        c.args[0]["mock_phase"]
+        for c in subs_tbl.update.call_args_list
+        if c.args and "mock_phase" in c.args[0]
+    ]
+    assert phase_writes == ["ocr", "extracting", "grading", "done"]
+
+
+async def test_mock_phase_set_to_error_on_processing_failure():
+    """mock_phase is set to 'error' in the same update as processing_error."""
+    photo_row = {
+        "id": "ph-1",
+        "submission_id": "sub-x",
+        "page_number": 1,
+        "storage_path": "student/sub-x/attempt_1/001.png",
+        "ocr_done_at": None,
+    }
+    mock_svc, _, mock_subs_tbl = _make_svc(photos_data=[photo_row])
+    mock_svc.storage.from_.return_value.download.return_value = None  # triggers storage_download_error
+
+    with (
+        patch("gradenza_api.jobs.process_submission.get_service_client", return_value=mock_svc),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch("gradenza_api.jobs.process_submission._run_ocr"),
+        patch("gradenza_api.jobs.process_submission.call_openrouter"),
+    ):
+        result = await process_submission({}, submission_id="sub-x", force=False)
+
+    assert result["error"] == "storage_download_error"
+    error_payloads = [
+        c.args[0]
+        for c in mock_subs_tbl.update.call_args_list
+        if c.args and c.args[0].get("processing_error") == "storage_download_error"
+    ]
+    assert len(error_payloads) == 1
+    assert error_payloads[0].get("mock_phase") == "error"

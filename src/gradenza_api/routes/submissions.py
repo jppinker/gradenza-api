@@ -75,7 +75,7 @@ async def _authorize_submission(
             .maybe_single()
             .execute()
         )
-        if not result.data:
+        if result is None or not result.data:
             return "not_found"
 
         row = result.data
@@ -135,22 +135,19 @@ async def process_submission(
                 .maybe_single()
                 .execute()
             )
-            return res.data
+            return res.data if res is not None else None
 
         scope = await asyncio.to_thread(_fetch_scope)
         if not scope:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found")
 
         submission_aqid = scope.get("assignment_question_id")
-        if submission_aqid != body.assignment_question_id:
-            def _write_mismatch() -> None:
-                svc = get_service_client()
-                svc.table("submissions").update({
-                    "processing_error": "assignment_question_id mismatch",
-                    "processing_error_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("id", submission_id).execute()
-
-            await asyncio.to_thread(_write_mismatch)
+        # Only reject when this is a per-question submission that doesn't match the
+        # requested question.  When submission_aqid is NULL (legacy full-assignment
+        # submission), the caller-supplied AQID is a valid grading-scope filter and
+        # must be allowed through.  Never persist processing_error for a request
+        # that is rejected before the job is even enqueued.
+        if submission_aqid is not None and submission_aqid != body.assignment_question_id:
             logger.warning(
                 "[submissions] assignment_question_id mismatch submission=%s expected=%s got=%s",
                 submission_id,
@@ -214,7 +211,7 @@ async def get_processing_status(
             .maybe_single()
             .execute()
         )
-        row = sub_res.data or {}
+        row = (sub_res.data if sub_res is not None else None) or {}
         submission_status = row.get("status")
         processing_error = row.get("processing_error")
         processing_error_at = row.get("processing_error_at")
