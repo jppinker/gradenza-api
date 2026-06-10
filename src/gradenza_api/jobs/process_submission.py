@@ -1130,6 +1130,18 @@ async def process_submission(
                 logger.debug("[job] photo %s already processed — skip", photo["id"])
                 continue
 
+            # Re-check cap before each LLM call so multi-page submissions cannot
+            # overshoot the cap after the pre-flight check already passed.
+            if job_user_id:
+                over_cap = await asyncio.to_thread(_is_over_credit_cap, job_user_id)
+                if over_cap:
+                    logger.warning(
+                        "[job] submission=%s user=%s exceeded credit cap mid-OCR — aborting",
+                        submission_id, job_user_id,
+                    )
+                    await asyncio.to_thread(_set_processing_error, "enqueue_insufficient_credits")
+                    return {"submission_id": submission_id, "error": "enqueue_insufficient_credits"}
+
             storage_path: str = photo["storage_path"]
             bucket: str = settings.submission_photos_bucket
 
@@ -1588,6 +1600,18 @@ async def process_submission(
 
         await asyncio.to_thread(_set_mock_phase, "grading")
         for question in questions:
+            # Re-check cap before each grading LLM call for the same reason as the
+            # mid-OCR check above — a long questions list could overshoot the cap.
+            if job_user_id:
+                over_cap = await asyncio.to_thread(_is_over_credit_cap, job_user_id)
+                if over_cap:
+                    logger.warning(
+                        "[job] submission=%s user=%s exceeded credit cap mid-grading — aborting",
+                        submission_id, job_user_id,
+                    )
+                    await asyncio.to_thread(_set_processing_error, "enqueue_insufficient_credits")
+                    return {"submission_id": submission_id, "error": "enqueue_insufficient_credits"}
+
             extracted_answers: dict[str, str | None] = {}
 
             if is_ib_style:
@@ -1648,7 +1672,7 @@ async def process_submission(
                 or (llm_result.get("overall_amber_reason") if llm_result else None)
             )
 
-            marks_awarded = _safe_int(llm_result.get("total_marks_awarded") or 0) if llm_result else 0
+            marks_awarded = _safe_float(llm_result.get("total_marks_awarded") or 0) if llm_result else 0.0
             marks_available_q = question.marks_available
             marks_awarded = max(0, min(marks_awarded, marks_available_q))
             confidence = _safe_float(llm_result.get("confidence") or 0) if llm_result else 0.0
@@ -1679,15 +1703,15 @@ async def process_submission(
                         "marks_available": marks_available_q,
                         "method_marks_awarded": (
                             None if (v := llm_result.get("total_method_marks")) is None
-                            else _safe_int(v)
+                            else _safe_float(v)
                         ) if llm_result else None,
                         "accuracy_marks_awarded": (
                             None if (v := llm_result.get("total_accuracy_marks")) is None
-                            else _safe_int(v)
+                            else _safe_float(v)
                         ) if llm_result else None,
                         "ft_marks_awarded": (
                             None if (v := llm_result.get("total_ft_marks")) is None
-                            else _safe_int(v)
+                            else _safe_float(v)
                         ) if llm_result else None,
                         "ft_applied": ft_applied,
                         "feedback_text": feedback_text,

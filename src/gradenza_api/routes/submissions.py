@@ -61,7 +61,10 @@ async def _authorize_submission(
     for this submission.
     - internal: always allowed
     - student: must own the submission
-    - teacher/tutor/co_teacher/school_admin: must own the class the assignment belongs to
+    - teacher/tutor: must own the class OR have created the assignment
+      (created_by covers classless tutor assignments that have no class)
+    - co_teacher: must have an accepted class_co_teachers row for the class
+    - school_admin: must share the same workspace as the class
     """
     if user.is_internal:
         return
@@ -70,7 +73,7 @@ async def _authorize_submission(
         svc = get_service_client()
         result = (
             svc.table("submissions")
-            .select("student_id, assignments(class_id, classes(teacher_id))")
+            .select("student_id, assignments(created_by, class_id, classes(teacher_id, workspace_id))")
             .eq("id", submission_id)
             .maybe_single()
             .execute()
@@ -82,21 +85,60 @@ async def _authorize_submission(
         if user.role == "student":
             if row.get("student_id") != user.id:
                 return "forbidden"
-        else:
-            # teacher-side roles
-            class_data = (
-                row.get("assignments") or {}
-            )
-            if isinstance(class_data, list):
-                class_data = class_data[0] if class_data else {}
-            teacher_id = (
-                (class_data.get("classes") or {}).get("teacher_id")
-                if isinstance(class_data.get("classes"), dict)
-                else None
-            )
-            if teacher_id != user.id:
+            return None
+
+        # teacher-side roles
+        assignment = row.get("assignments") or {}
+        if isinstance(assignment, list):
+            assignment = assignment[0] if assignment else {}
+        class_id: str | None = assignment.get("class_id")
+        created_by: str | None = assignment.get("created_by")
+        classes = assignment.get("classes") or {}
+        if isinstance(classes, list):
+            classes = classes[0] if classes else {}
+        teacher_id: str | None = classes.get("teacher_id")
+
+        if user.role in ("teacher", "tutor"):
+            # Owns the class OR created the assignment (covers classless tutor assignments).
+            if teacher_id == user.id or created_by == user.id:
+                return None
+            return "forbidden"
+
+        if user.role == "co_teacher":
+            if not class_id:
                 return "forbidden"
-        return None
+            co_res = (
+                svc.table("class_co_teachers")
+                .select("id")
+                .eq("class_id", class_id)
+                .eq("user_id", user.id)
+                .not_.is_("accepted_at", "null")
+                .maybe_single()
+                .execute()
+            )
+            if co_res and co_res.data:
+                return None
+            return "forbidden"
+
+        if user.role == "school_admin":
+            if not class_id:
+                return "forbidden"
+            class_workspace: str | None = classes.get("workspace_id")
+            if not class_workspace:
+                return "forbidden"
+            user_res = (
+                svc.table("users")
+                .select("workspace_id")
+                .eq("id", user.id)
+                .maybe_single()
+                .execute()
+            )
+            user_workspace = ((user_res.data if user_res else None) or {}).get("workspace_id")
+            if class_workspace == user_workspace:
+                return None
+            return "forbidden"
+
+        return "forbidden"
 
     error = await asyncio.to_thread(_check)
     if error == "not_found":
