@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from gradenza_api.redis_config import build_redis_settings
-from gradenza_api.routes import analytics, canvas_chat, class_pdf_notes, materials, ocr, online_lessons, quiz, study_rooms_sonic, submissions
+from gradenza_api.routes import analytics, canvas_chat, class_pdf_notes, materials, ocr, online_lessons, quiz, study_rooms_sonic, submissions, video
 from gradenza_api.services.pdf_playwright import get_playwright_runtime_diagnostics
 from gradenza_api.settings import settings
 
@@ -124,6 +124,7 @@ app.include_router(online_lessons.router)
 app.include_router(quiz.router)
 app.include_router(study_rooms_sonic.router)
 app.include_router(submissions.router)
+app.include_router(video.router)
 
 
 # ── Health check ───────────────────────────────────────────────────────────────

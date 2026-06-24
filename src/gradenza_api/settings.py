@@ -24,6 +24,11 @@ class Settings(BaseSettings):
 
     # Storage
     submission_photos_bucket: str = "submission-photos"
+    tutor_video_bucket: str = "tutor-videos"
+
+    # Tutor video generation
+    openrouter_video_prompt_model: str = "openai/gpt-5.5"
+    openrouter_video_prompt_fallback_model: str = "google/gemini-3-flash-preview"
 
     # ── Online lesson AI models ────────────────────────────────────────────────
     # Chat and question generation use GPT-5.5 via OpenRouter.
